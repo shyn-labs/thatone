@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>ThatOne</string>
+  <key>CFBundleIdentifier</key><string>com.shynlabs.thatone</string>
+  <key>CFBundleName</key><string>ThatOne</string>
+  <key>CFBundleDisplayName</key><string>ThatOne</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.2.0</string>
+  <key>CFBundleVersion</key><string>2</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>ThatOne reads the images in this folder so you can find them by describing them. Nothing leaves your Mac.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>ThatOne reads the images in this folder so you can find them by describing them. Nothing leaves your Mac.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>ThatOne reads the images in this folder so you can find them by describing them. Nothing leaves your Mac.</string>
+  <key>NSPhotoLibraryUsageDescription</key>
+  <string>ThatOne reads your photos on this Mac so you can find them by describing them. Nothing leaves your Mac.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>ThatOne asks Photos to show the photo you picked.</string>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>ThatOne reads the images on this drive so you can find them by describing them. Nothing leaves your Mac.</string>
+</dict></plist>

@@ -1,0 +1,23 @@
+[project]
+name = "thatone-gemma-worker"
+version = "0.0.1"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "mlx>=0.32.3",
+  "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm.git@3d87e88402f307efbf68e568971aa887ee7d9ed0",
+  "transformers @ git+https://github.com/huggingface/transformers.git",
+  "torch>=2.6",
+  "torchvision>=0.21",
+  "pillow>=10.1",
+  "numpy>=2.0",
+  "thatone-protocol",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+thatone-protocol = { path = "../protocol", editable = true }

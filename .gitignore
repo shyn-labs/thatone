@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+# personal data must never land here
+*.npz
+manifest.jsonl
+segments.jsonl
+errors.jsonl
+golden.yaml
+
+# engine
+engine/.build/
+engine/.local/
+.local-deps/
+.superpowers/
+
+# app
+app/.build/
+app/build/

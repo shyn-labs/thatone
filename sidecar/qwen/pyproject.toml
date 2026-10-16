@@ -1,0 +1,14 @@
+[project]
+name = "thatone-qwen-worker"
+version = "0.0.1"
+requires-python = ">=3.12,<3.13"
+dependencies = ["mlx-embeddings", "mlx-lm", "pillow>=10.1", "numpy>=2.0", "thatone-protocol"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+thatone-protocol = { path = "../protocol", editable = true }
