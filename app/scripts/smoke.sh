@@ -3,21 +3,22 @@
 # with the CLI over the socket, and check one-instance and quit. Prints SMOKE OK on success.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-APP="$ROOT/app/build/ThatOne.app/Contents/MacOS/ThatOne"
+APP="${THATONE_APP:-$ROOT/app/build/ThatOne.app}/Contents/MacOS/ThatOne"   # THATONE_APP: another bundle, e.g. app/build/release/ThatOne.app
 [ -x "$APP" ] || { echo "build the app first: app/scripts/build-app.sh"; exit 1; }
 (cd "$ROOT/engine" && swift build --product thatone > /dev/null)
 CLI="$(cd "$ROOT/engine" && swift build --show-bin-path)/thatone"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ths.XXXXXX")"          # short: Unix socket paths are limited to 103 bytes
 export THATONE_HOME="$WORK/home" THATONE_KEY_HEX="$(printf '07%.0s' $(seq 32))" THATONE_NO_HOTKEY=1
-mkdir -p "$THATONE_HOME" "$WORK/pics"
+mkdir -p "$THATONE_HOME" "$WORK/pics" "$WORK/placeholder"
 PID=""
 cleanup() { [ -n "$PID" ] && kill "$PID" 2>/dev/null || true; rm -rf "$WORK"; }
 trap cleanup EXIT
 fail() { echo "SMOKE FAILED: $*"; exit 1; }
 
+# One empty placeholder folder: with no folders the app opens its Welcome window, which offers the real home folders.
 cat > "$THATONE_HOME/config.json" <<JSON
-{"folders": [], "exclude": [], "sidecar": ["$ROOT/bakeoff/.venv/bin/python", "$ROOT/bakeoff/tests/fake_worker.py"], "sidecarEnv": {}}
+{"folders": ["$WORK/placeholder"],"exclude": [], "sidecar": ["$ROOT/bakeoff/.venv/bin/python", "$ROOT/bakeoff/tests/fake_worker.py"], "sidecarEnv": {}}
 JSON
 "$ROOT/bakeoff/.venv/bin/python" - "$WORK/pics" <<'PY'
 import struct, sys, zlib

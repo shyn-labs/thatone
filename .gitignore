@@ -19,3 +19,7 @@ engine/.local/
 # app
 app/.build/
 app/build/
+
+# release builds
+app/.build-release/
+dist/
