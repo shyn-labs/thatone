@@ -1084,7 +1084,7 @@ def run_build(rel, gate_rc, **extra):
         "THATONE_CODESIGN": "/nonexistent-fake", "SHYN_GATE_USERNAME": NAME, "SHYN_GATE_TEST_DELAY_MS": "5",
         "HOME": pwd.getpwuid(os.getuid()).pw_dir,  # a release refuses any other HOME
     })
-    for k in [k for k in env if k in ("BASH_ENV", "ENV") or k.startswith("BASH_FUNC_")]:
+    for k in [k for k in env if k in ("BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "PS4") or k.startswith("BASH_FUNC_")]:
         env.pop(k)
     args = extra.pop("_args", ["--release"])
     env.update(extra)
@@ -1208,15 +1208,20 @@ def test_release_refuses_foreign_home_before_swift(rel):
 ENV_FN = "() { exit 0; }"
 
 
-@pytest.mark.parametrize("kind", ["bash_env", "bash_env_full_path_function", "env_var", "exported_function"])
+@pytest.mark.parametrize("kind", ["bash_env", "bash_env_full_path_function", "env_var", "exported_function",
+                                  "exported_builtin_function", "shellopts", "bashopts", "ps4"])
 def test_release_refuses_command_replacing_shell_environment(rel, kind):
     startup = write(os.path.join(rel, "startup.sh"), "env() { exit 0; }\n")
     full = write(os.path.join(rel, "startup-full.sh"), "/usr/bin/env() { exit 0; }\n")
+    # an exported `builtin` used to hide every other function from `builtin declare -F`
     extra = {"bash_env": {"BASH_ENV": startup}, "bash_env_full_path_function": {"BASH_ENV": full},
-             "env_var": {"ENV": startup}, "exported_function": {"BASH_FUNC_env%%": ENV_FN}}[kind]
+             "env_var": {"ENV": startup}, "exported_function": {"BASH_FUNC_env%%": ENV_FN},
+             "exported_builtin_function": {"BASH_FUNC_builtin%%": ENV_FN, "BASH_FUNC_env%%": ENV_FN},
+             "shellopts": {"SHELLOPTS": "braceexpand:hashall:interactive-comments:xtrace"},
+             "bashopts": {"BASHOPTS": "extglob"}, "ps4": {"PS4": "+ "}}[kind]
     rc, out = run_build(rel, 1, **extra)
     assert rc == 1, out
-    assert "BASH_ENV, ENV or an exported shell function" in out
+    assert "BASH_ENV, ENV, an exported shell function or inherited shell options" in out
     assert not os.path.exists(os.path.join(rel, "fake.log"))
     assert not os.path.exists(pkg(rel)) and not os.path.exists(pkg(rel) + ".partial")
 

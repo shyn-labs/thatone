@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/env -S -u SHELLOPTS -u BASHOPTS -u PS4 -u BASH_ENV -u ENV bash
 # Builds app/build/ThatOne.app (ad-hoc signed; for use on this Mac). `--install` also copies it to ~/Applications.
 # `--release` instead builds the distributable app/build/release/ThatOne.app and its archive (see the release block below).
 set -euo pipefail
@@ -34,8 +34,11 @@ if [ "$RELEASE" = 1 ]; then
   fi
   # The gate reads the denylist, allowlist and home needle from HOME, so a release runs with the user's real home only.
   # A startup file (BASH_ENV / ENV) or an exported shell function can replace any command the release decision runs (a
-  # function may even be named /usr/bin/env), so both are refused; the tools that decide the outcome are called by full
-  # path below.
+  # function may even be named /usr/bin/env), and inherited SHELLOPTS / BASHOPTS / PS4 (e.g. xtrace with a command
+  # substitution in PS4) run code at every line, so all are refused; the tools that decide the outcome are called by full
+  # path below. Exported functions are read from the environment by /usr/bin/env, never via `declare -F`: an exported
+  # function named `builtin` or `declare` would hide them. Run directly, the shebang already strips the startup files and
+  # shell options; the check covers `bash app/scripts/build-app.sh`.
   REAL_HOME="$(/usr/bin/dscl . -read "/Users/$(/usr/bin/id -un)" NFSHomeDirectory 2>/dev/null \
                | /usr/bin/sed -n 's/^NFSHomeDirectory: //p')"
   if [[ -z "$REAL_HOME" || "${HOME-}" != "$REAL_HOME" ]]; then
@@ -43,9 +46,10 @@ if [ "$RELEASE" = 1 ]; then
          "needle from it); build with the real HOME" >&2
     exit 1
   fi
-  if [[ -n "${BASH_ENV+set}${ENV+set}" || -n "$(builtin declare -F)" ]]; then
-    echo "build-app.sh --release: BASH_ENV, ENV or an exported shell function is set; they can replace the commands" \
-         "that decide the release; unset them" >&2
+  if [[ -n "${BASH_ENV+set}${ENV+set}" \
+        || -n "$(/usr/bin/env | /usr/bin/grep -E '^(BASH_FUNC_|SHELLOPTS=|BASHOPTS=|PS4=)' || true)" ]]; then
+    echo "build-app.sh --release: BASH_ENV, ENV, an exported shell function or inherited shell options" \
+         "(SHELLOPTS, BASHOPTS, PS4) are set; they can replace or trace the commands that decide the release; unset them" >&2
     exit 1
   fi
   # Signing identity: THATONE_RELEASE_IDENTITY (a name or SHA-1 hash), else the project's self-signed "Shyn Dev".
