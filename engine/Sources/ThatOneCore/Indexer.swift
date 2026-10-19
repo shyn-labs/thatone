@@ -23,6 +23,9 @@ public final class Indexer {
     /// OCR errors are tolerated only for images too small to hold legible text (Vision refuses sides of 2 px or less).
     /// For anything bigger an OCR error means the secret gate could not run, so the file is not embedded.
     static let minOCRSide = 16
+    /// Reason prefix of a file waiting because text recognition refused to start (too many stuck Vision calls).
+    static let ocrUnavailable = "ocr unavailable"
+    static let ocrUnavailableReason = "\(ocrUnavailable): text recognition is busy with stuck calls, will retry"
 
     private let store: Store
     private let embedder: Embedder
@@ -38,6 +41,7 @@ public final class Indexer {
     private let readers: [String: FileReader]
     private let shouldContinue: () -> Bool
     private let frameCutter: FrameCutting
+    private let ocrTimeouts: OCRTimeoutBreaker
     /// Temporary JPEGs for the sidecar live here, in a folder private to this run.
     let runDirectory: URL
 
@@ -51,8 +55,10 @@ public final class Indexer {
                 readers: [String: FileReader]? = nil,
                 transcriber: Transcriber? = nil,
                 frameCutter: FrameCutting = NoFrameCutter(),
+                ocrTimeouts: OCRTimeoutBreaker = OCRTimeoutBreaker(),
                 shouldContinue: @escaping () -> Bool = { true }) {
         self.shouldContinue = shouldContinue
+        self.ocrTimeouts = ocrTimeouts
         self.assets = assets
         self.enabledKinds = enabledKinds
         self.unavailableKinds = unavailableKinds
@@ -231,10 +237,17 @@ public final class Indexer {
     private func prepare(_ path: String, size: Int64, mtime: Int64, hash: String, decoded preDecoded: DecodedImage?,
                          outcomes: inout [String: IndexOutcome]) -> Pending? {
         do {
+            // Its OCR already ran past the deadline in this process: do not give Vision the same image again.
+            guard !ocrTimeouts.isTripped(path: path, size: size, mtime: mtime) else { throw ReadFailure.timedOut }
             let decoded = try preDecoded ?? ImagePrep.decode(URL(fileURLWithPath: path))
             var text = ""
             var note = ""
             do { text = try ocr(decoded.ocrImage) }
+            catch ReadFailure.timedOut {                                   // Vision stuck: "reading took too long", whatever the size
+                ocrTimeouts.noteTimeout(path: path, size: size, mtime: mtime)
+                throw ReadFailure.timedOut
+            }
+            catch let busy as OCRUnavailable { throw busy }                // nothing ran: the file waits, whatever the size
             catch {
                 guard min(decoded.ocrImage.width, decoded.ocrImage.height) < Self.minOCRSide else {
                     throw IndexerError.ocrFailed(error.localizedDescription)
@@ -252,6 +265,9 @@ public final class Indexer {
             let jpeg = runDirectory.appendingPathComponent("\(hash).jpg")
             try ImagePrep.writeJPEG(decoded.smallImage, to: jpeg)
             return Pending(path: path, hash: hash, size: size, mtime: mtime, jpeg: jpeg, text: text, note: note)
+        } catch is OCRUnavailable {
+            outcomes[path] = .deferred(Self.ocrUnavailableReason)          // nothing recorded: what was indexed stays
+            return nil
         } catch {
             outcomes[path] = recordFailure(path, size: size, mtime: mtime, message: describe(error))
             return nil
@@ -306,6 +322,10 @@ public final class Indexer {
     private func indexFile(_ path: String, kind: String, size: Int64, mtime: Int64, hash: String) -> IndexOutcome {
         guard let reader = readers[kind] else { return .skipped("unsupported file type") }
         let result: ReadResult
+        // A PDF whose page OCR already ran past the deadline in this process fails again without reading.
+        if kind == "pdf", keptReads[hash] == nil, ocrTimeouts.isTripped(path: path, size: size, mtime: mtime) {
+            return recordFailure(path, size: size, mtime: mtime, message: "reading took too long")
+        }
         do { result = try keptReads[hash] ?? reader.read(URL(fileURLWithPath: path)) }
         catch let failure as ReadFailure {
             switch failure {
@@ -313,8 +333,12 @@ public final class Indexer {
             case .empty(let why): return recordSkip(path, kind, size, mtime, why)
             case .tooLarge: return recordSkip(path, kind, size, mtime, "too large")
             case .unreadable(let why): return recordFailure(path, size: size, mtime: mtime, message: "cannot read: \(String(why.prefix(120)))")
-            case .timedOut: return recordFailure(path, size: size, mtime: mtime, message: "reading took too long")
+            case .timedOut:
+                if kind == "pdf" { ocrTimeouts.noteTimeout(path: path, size: size, mtime: mtime) }   // only OCR times out in a PDF
+                return recordFailure(path, size: size, mtime: mtime, message: "reading took too long")
             }
+        } catch is OCRUnavailable {
+            return .deferred(Self.ocrUnavailableReason)                    // nothing recorded: what was indexed stays
         } catch let failure as TranscribeFailure {
             switch failure {
             case .unavailable(let why): return .deferred("transcription unavailable: \(why)")

@@ -46,6 +46,8 @@ public final class PDFReader: FileReader {
                 guard let rendered = Self.render(page, longSide: Self.ocrSide) else { return }
                 let recognized: String
                 do { recognized = Self.clean(try ocr(rendered)) }
+                catch ReadFailure.timedOut { throw ReadFailure.timedOut }                // fails the file: "reading took too long"
+                catch let busy as OCRUnavailable { throw busy }                           // nothing ran: the file waits
                 catch { throw ReadFailure.unreadable("ocr failed on page \(number)") }   // the secret gate could not run
                 let anchor = TextChunker.anchorJSON(page: number, part: nil, heading: nil)
                 characters += recognized.count

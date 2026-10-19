@@ -38,6 +38,66 @@ public struct CodeLanguage {
         return nil
     }
 
+    /// Whether a code line (trimmed) is, or with `opening` begins, an attribute or a decorator that belongs to the
+    /// declaration below it: `@available(macOS 13, *)`, `@app.route("/x")`, `@Override`, `#[derive(Debug)]`,
+    /// C# `[Obsolete]`, C++ `[[nodiscard]]`. A whole line must be attributes, so `@Published var x = 1` is not one.
+    /// Hand-written scans, linear in the line: the line comes from an untrusted file, so no backtracking pattern.
+    func isAttribute(_ trimmed: String, opening: Bool = false) -> Bool {
+        let c = Array(trimmed.unicodeScalars.prefix(400))
+        switch name {
+        case "swift", "javascript", "python", "kotlin", "scala": return Self.atAttributes(c, opening: opening)
+        case "java":                                                                     // Java annotations, C# attributes
+            if Self.atAttributes(c, opening: opening) { return true }
+            guard c.count >= 2, c[0] == "[", Self.isIdentifierStart(c[1]) else { return false }
+            return opening || c.last == "]"
+        case "rust":                                                                     // never `#![`: that is the module's
+            guard c.count >= 2, c[0] == "#", c[1] == "[" else { return false }
+            return opening || (c.count >= 3 && c.last == "]")
+        case "c":
+            guard c.count >= 2, c[0] == "[", c[1] == "[" else { return false }
+            return opening || (c.count >= 4 && c[c.count - 1] == "]" && c[c.count - 2] == "]")
+        default: return false
+        }
+    }
+
+    static func isIdentifierStart(_ u: Unicode.Scalar) -> Bool { u == "_" || (u.isASCII && u.properties.isAlphabetic) }
+
+    /// `@name` or `@name(args)`, repeated with optional spaces, filling the line. With `opening`, the line instead
+    /// begins `@name(` (the first line of a multi-line attribute). Parentheses are matched by depth; quoted strings
+    /// inside them are skipped, so `message: "use (x)"` does not unbalance them. One pass, no backtracking.
+    static func atAttributes(_ c: [Unicode.Scalar], opening: Bool) -> Bool {
+        var i = 0, count = 0
+        while true {
+            while i < c.count, c[i] == " " || c[i] == "\t" { i += 1 }
+            if i == c.count { return count > 0 && !opening }
+            guard c[i] == "@", i + 1 < c.count, isIdentifierStart(c[i + 1]) else { return false }
+            i += 2
+            while i < c.count, c[i] == "_" || c[i] == "." || c[i].properties.isAlphabetic || c[i].properties.numericType != nil { i += 1 }
+            if i < c.count, c[i] == "(" {
+                if opening { return count == 0 }
+                var depth = 0
+                while i < c.count {
+                    let u = c[i]
+                    if u == "\"" || u == "'" {                                // a string literal: skip to its closing quote
+                        i += 1
+                        while i < c.count, c[i] != u { i += c[i] == "\\" ? 2 : 1 }
+                    } else if u == "(" {
+                        depth += 1
+                    } else if u == ")" {
+                        depth -= 1
+                        if depth == 0 { i += 1; break }
+                    }
+                    i += 1
+                }
+                if depth != 0 { return false }                               // never closed on this line
+            } else if opening {
+                return false
+            }
+            count += 1
+            if i < c.count, c[i] != " ", c[i] != "\t", c[i] != "@" { return false }   // `@a(b) c`, `@objc // why`
+        }
+    }
+
     func escapes(_ delimiter: String) -> Bool {
         !(name == "go" && delimiter == "`") && !(delimiter == "'" && (name == "shell" || name == "sql"))
     }
@@ -144,41 +204,77 @@ struct LineFacts: Equatable {
     var brackets = 0             // net ( [ { minus ) ] }
     var lastCodeChar: Character?
     var hasCode = false          // any non-space character outside comments
+    var startsInComment = false  // inside a block comment at its first character
+    var hasComment = false       // any comment on the line (a line comment, a block comment or part of one)
+    var hasStringText = false    // any non-space character inside a string that began on an earlier line
+    /// Nothing but comment: a doc-comment line, a block comment's inside or its blank line.
+    var isCommentOnly: Bool { !hasCode && !hasStringText && (hasComment || startsInComment) }
 }
 
 enum CodeScanner {
-    private enum State { case code, block, string(String, escapes: Bool) }
+    private enum State { case code, block, string(String, [Unicode.Scalar], escapes: Bool) }
 
+    /// `Character.isWhitespace` for one scalar, without a Unicode property lookup for ASCII.
+    @inline(__always) static func isSpace(_ u: Unicode.Scalar) -> Bool {
+        u.value < 0x80 ? (u.value == 0x20 || (0x09...0x0D).contains(u.value)) : u.properties.isWhitespace
+    }
+
+    /// One pass over each line's Unicode scalars (cheaper than grapheme clusters, and every token is ASCII). Tokens are
+    /// split once per file and compared in place, and an ASCII scalar that cannot open a comment, a string or a quote
+    /// takes a short path, so a file of long hostile lines stays fast.
     static func facts(_ lines: [String], _ lang: CodeLanguage) -> [LineFacts] {
         var state = State.code
+        let open = lang.blockComment.map { Array($0.open.unicodeScalars) }, close = lang.blockComment.map { Array($0.close.unicodeScalars) }
+        let lineComments = lang.lineComments.map { (token: $0, chars: Array($0.unicodeScalars)) }
+        let strings = lang.strings.map { (token: $0, chars: Array($0.unicodeScalars), escapes: lang.escapes($0)) }
+        var special = [Bool](repeating: false, count: 128)       // ASCII scalars that may start a comment, a string or a quote
+        if lang.charLiterals { special[Int(("'" as Unicode.Scalar).value)] = true }
+        for token in [open].compactMap({ $0 }) + lineComments.map(\.chars) + strings.map(\.chars) {
+            if let first = token.first, first.value < 128 { special[Int(first.value)] = true }
+        }
         var out: [LineFacts] = []
         out.reserveCapacity(lines.count)
         for line in lines {
             var f = LineFacts()
             if case .code = state {} else { f.startsInCode = false }
-            let c = Array(line)
-            func starts(_ token: String, at k: Int) -> Bool {
-                let t = Array(token)
+            if case .block = state { f.startsInComment = true }
+            let c = Array(line.unicodeScalars)
+            func starts(_ t: [Unicode.Scalar], at k: Int) -> Bool {
                 guard k + t.count <= c.count else { return false }
-                return Array(c[k..<(k + t.count)]) == t
+                for j in 0..<t.count where c[k + j] != t[j] { return false }
+                return true
             }
             var i = 0
             scan: while i < c.count {
                 switch state {
                 case .block:
-                    if let close = lang.blockComment?.close, starts(close, at: i) { state = .code; i += close.count } else { i += 1 }
-                case .string(let d, let escapes):
+                    if !isSpace(c[i]) { f.hasComment = true }
+                    if let close, starts(close, at: i) { state = .code; i += close.count } else { i += 1 }
+                case .string(_, let d, let escapes):
+                    if !f.hasCode && !isSpace(c[i]) { f.hasStringText = true }
                     if escapes && c[i] == "\\" { i += 2; continue }
                     if starts(d, at: i) { state = .code; i += d.count } else { i += 1 }
                 case .code:
-                    if let open = lang.blockComment?.open, starts(open, at: i) { state = .block; i += open.count; continue }
-                    let comment = lang.lineComments.contains { token in
-                        starts(token, at: i) && (token != "#" || lang.name != "shell" || i == 0 || c[i - 1] == " " || c[i - 1] == "\t")
+                    let u = c[i]
+                    if u.value < 128 && !special[Int(u.value)] {
+                        switch u {
+                        case "{", "(", "[": f.marks.append(Character(u)); f.brackets += 1
+                        case "}", ")", "]": f.marks.append(Character(u)); f.brackets -= 1
+                        default: break
+                        }
+                        if !isSpace(u) { f.hasCode = true; f.lastCodeChar = Character(u) }
+                        i += 1; continue
                     }
-                    if comment { break scan }
-                    if let d = lang.strings.first(where: { starts($0, at: i) }) {
-                        f.hasCode = true; f.lastCodeChar = c[i]
-                        state = .string(d, escapes: lang.escapes(d)); i += d.count; continue
+                    if let open, starts(open, at: i) { state = .block; f.hasComment = true; i += open.count; continue }
+                    for token in lineComments where starts(token.chars, at: i)
+                        && (token.token != "#" || lang.name != "shell" || i == 0 || c[i - 1] == " " || c[i - 1] == "\t") {
+                        f.hasComment = true; break scan
+                    }
+                    var opened: (token: String, chars: [Unicode.Scalar], escapes: Bool)?
+                    for d in strings where starts(d.chars, at: i) { opened = d; break }
+                    if let d = opened {
+                        f.hasCode = true; f.lastCodeChar = Character(c[i])
+                        state = .string(d.token, d.chars, escapes: d.escapes); i += d.chars.count; continue
                     }
                     if c[i] == "'" && lang.charLiterals {
                         f.hasCode = true; f.lastCodeChar = "'"
@@ -193,16 +289,16 @@ enum CodeScanner {
                     }
                     let ch = c[i]
                     switch ch {
-                    case "{", "(", "[": f.marks.append(ch); f.brackets += 1
-                    case "}", ")", "]": f.marks.append(ch); f.brackets -= 1
+                    case "{", "(", "[": f.marks.append(Character(ch)); f.brackets += 1
+                    case "}", ")", "]": f.marks.append(Character(ch)); f.brackets -= 1
                     default: break
                     }
-                    if !ch.isWhitespace { f.hasCode = true; f.lastCodeChar = ch }
+                    if !isSpace(ch) { f.hasCode = true; f.lastCodeChar = Character(ch) }
                     i += 1
                 }
             }
             // A one-character quote cannot run past its line: an unclosed one (or a misread) ends here.
-            if case .string(let d, _) = state, !lang.multiLine(d) { state = .code }
+            if case .string(let d, _, _) = state, !lang.multiLine(d) { state = .code }
             out.append(f)
         }
         return out

@@ -18,6 +18,9 @@ public enum CodeChunker {
     /// Declarations are looked for this many levels deep (`A.B.C.d`); a long declaration deeper than that is windowed
     /// whole. Bounds the stack (one frame per level, and GCD workers get 512 KB) and the cost (each level rescans its body).
     public static let maxNesting = 4
+    /// At most this many comment and attribute lines above a declaration join its chunk (the nearest ones); a longer
+    /// stretch (commented-out code, a long licence) keeps the rest as a plain, symbol-less chunk.
+    public static let maxLeading = 30
 
     private struct Span {
         var start: Int, end: Int              // 0-based, inclusive
@@ -67,24 +70,59 @@ public enum CodeChunker {
         while i <= to {
             guard facts[i].startsInCode, let name = lang.declarationName(lines[i]) else { i += 1; continue }
             let end = blockEnd(lines, facts, lang, from: i, limit: to)
-            if gapStart < i { out.append(Span(start: gapStart, end: i - 1, symbol: parent, isDeclaration: false)) }
+            let top = leadingStart(lines, facts, lang, declaration: i, lower: gapStart)
+            if gapStart < top { out.append(Span(start: gapStart, end: top - 1, symbol: parent, isDeclaration: false)) }
             let symbol = parent.map { "\($0).\(name)" } ?? name
             var body: [Span] = []
-            if end - i + 1 > splitAbove, end - 1 >= i + 1, depth + 1 < maxNesting {
+            if end - top + 1 > splitAbove, end - 1 >= i + 1, depth + 1 < maxNesting {
                 body = segment(lines, facts, lang, from: i + 1, to: end - 1, parent: symbol, depth: depth + 1)
             }
             if body.contains(where: { $0.isDeclaration }) {
-                body[0].start = i
+                body[0].start = top
                 body[body.count - 1].end = end
                 out += body
             } else {
-                out.append(Span(start: i, end: end, symbol: symbol, isDeclaration: true))
+                out.append(Span(start: top, end: end, symbol: symbol, isDeclaration: true))
             }
             i = end + 1
             gapStart = i
         }
         if gapStart <= to { out.append(Span(start: gapStart, end: to, symbol: parent, isDeclaration: false)) }
         return out
+    }
+
+    /// Where the declaration at `declaration` really starts: the first of the comment, decorator and attribute lines
+    /// directly above it (`///`, `/** */`, `#`, `--`, `@decorator`, `#[derive(...)]`), with no blank line between, so a
+    /// hit on the doc comment anchors the whole declaration. A blank line ends the walk, so a licence header or a section
+    /// divider followed by a blank line stays apart; so do a shebang and a Rust module doc (`#!`, `//!`). Never above `lower`,
+    /// and never more than `maxLeading` lines: only the nearest ones join, the rest stay a symbol-less chunk as before.
+    /// A licence block directly above the first declaration (no blank line) and within the cap does join it: it cannot be
+    /// told from a doc comment without reading its words, and attaching it only widens that declaration's chunk.
+    static func leadingStart(_ lines: [String], _ facts: [LineFacts], _ lang: CodeLanguage, declaration: Int, lower: Int) -> Int {
+        let indent = indentWidth(lines[declaration])
+        let floor = max(lower, declaration - maxLeading)
+        var top = declaration
+        var k = declaration - 1
+        while k >= floor {
+            let f = facts[k]
+            let trimmed = lines[k].trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("#!") || trimmed.hasPrefix("//!") { break }
+            // Indentation languages: a comment indented deeper than the declaration is the tail of the block above it.
+            if lang.family == .indent, f.startsInCode, !isBlank(lines[k]), indentWidth(lines[k]) > indent { break }
+            if f.isCommentOnly { top = k; k -= 1; continue }
+            guard f.startsInCode, f.hasCode else { break }
+            if f.brackets == 0, lang.isAttribute(trimmed) { top = k; k -= 1; continue }
+            if f.brackets < 0 {                                  // the last line of a multi-line attribute: find where it opens
+                var net = 0, m = k
+                while m >= floor { net += facts[m].brackets; if net >= 0 { break }; m -= 1 }
+                if m >= floor, net == 0, facts[m].startsInCode,
+                   lang.isAttribute(lines[m].trimmingCharacters(in: .whitespaces), opening: true) {
+                    top = m; k = m - 1; continue
+                }
+            }
+            break
+        }
+        return top
     }
 
     private static func blockEnd(_ lines: [String], _ facts: [LineFacts], _ lang: CodeLanguage, from i: Int, limit: Int) -> Int {
@@ -103,11 +141,19 @@ public enum CodeChunker {
         var opened = false
         var j = i
         while j <= limit {
-            if j > i && !opened && parens == 0
-                && (isBlank(lines[j]) || (facts[j].startsInCode && lang.declarationName(lines[j]) != nil)) {
-                var last = j - 1                               // no body: a requirement, a forward declaration, an alias
-                while last > i && isBlank(lines[last]) { last -= 1 }
-                return last
+            if j > i && !opened && parens == 0 {
+                // No body (a requirement, a prototype, an interface method): it ends before a blank line, or before
+                // the next declaration's own comment and attribute lines, which belong to that declaration.
+                var stop: Int?
+                if isBlank(lines[j]) { stop = j }
+                else if facts[j].startsInCode && lang.declarationName(lines[j]) != nil {
+                    stop = leadingStart(lines, facts, lang, declaration: j, lower: i + 1)
+                }
+                if let stop {
+                    var last = stop - 1
+                    while last > i && isBlank(lines[last]) { last -= 1 }
+                    return last
+                }
             }
             for mark in facts[j].marks {
                 if opened {

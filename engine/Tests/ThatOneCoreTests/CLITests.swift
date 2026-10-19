@@ -37,7 +37,7 @@ final class CLITests: XCTestCase {
 
         let indexed = run(["index", folder.path], home: home, embedder: fake)
         XCTAssertEqual(indexed.code, 0, indexed.err.joined())
-        XCTAssertTrue(indexed.out.contains { $0.contains("queued 1 image") })
+        XCTAssertTrue(indexed.out.contains { $0.contains("queued 1 file(s)") })
         XCTAssertTrue(indexed.out.contains { $0.contains("indexed 1,") })
 
         let found = run(["search", "4471", "--json"], home: home, embedder: fake)
@@ -73,7 +73,7 @@ final class CLITests: XCTestCase {
         try Data((a.path + "\n\n/missing/file.png\n").utf8).write(to: list)
         let r = run(["index", "--files-from", list.path], home: home, embedder: FakeEmbedder())
         XCTAssertEqual(r.code, 0, r.err.joined())
-        XCTAssertTrue(r.out.contains { $0.contains("queued 1 image") })
+        XCTAssertTrue(r.out.contains { $0.contains("queued 1 file(s)") })
         let status = run(["status", "--json"], home: home, embedder: FakeEmbedder())
         let report = try JSONSerialization.jsonObject(with: Data(status.out.joined(separator: "\n").utf8)) as! [String: Any]
         XCTAssertEqual((report["folders"] as! [String]), [])      // explicit files do not add a watched folder

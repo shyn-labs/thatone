@@ -159,4 +159,13 @@ extension Store {
         try query("select path, note from files where status = 'failed' or (status = 'indexed' and substr(note, 1, ?) = ?) order by path",
                   [.int(Int64(Self.keptAfterFailure.unicodeScalars.count)), .text(Self.keptAfterFailure)]) { (path: $0.text(0), note: $0.text(1)) }
     }
+
+    /// Skipped files by path with why ("too large", "minified", "generated", "not a text file", "secret", ...), at most
+    /// `limit` of them, and how many there are in all.
+    public func skippedFiles(limit: Int) throws -> (files: [(path: String, note: String)], total: Int) {
+        let files = try query("select path, note from files where status = 'skipped' order by path limit ?", [.int(Int64(limit))]) {
+            (path: $0.text(0), note: $0.text(1))
+        }
+        return (files, Int(try int("select count(*) from files where status = 'skipped'") ?? 0))
+    }
 }

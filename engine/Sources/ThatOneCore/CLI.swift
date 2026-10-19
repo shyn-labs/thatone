@@ -138,7 +138,7 @@ public enum CLI {
                 throw ServiceError.remote("the app is running: quit it first (explicit file lists are indexed directly)")
             }
             let queued = try app.index(folders: p.positional.map(absolute))
-            out("queued \(queued) image(s); the app is indexing in the background")
+            out("queued \(queued) file(s); the app is indexing in the background")
             try follow(app, out, err)
             return
         }
@@ -155,7 +155,7 @@ public enum CLI {
             queued = scan.enqueued
             if scan.purgeQueued > 0 { out("checking \(scan.purgeQueued) file(s) that disappeared or are now excluded") }
         }
-        out("queued \(queued) image(s)")
+        out("queued \(queued) file(s)")
         // runIndexing's progress closure is escaping by type; it never outlives this call, so lend it `err`.
         let summary = try withoutActuallyEscaping(err) { escapableErr in
             try e.runIndexing { done, waiting in escapableErr("\r\(done) done, \(waiting) waiting") }
@@ -214,6 +214,9 @@ public enum CLI {
         }
     }
 
+    /// How many skipped files `thatone status` prints before "(+N more)"; `--json` lists up to 200.
+    static let skippedTextLimit = 20
+
     static func status(_ args: [String], _ service: () throws -> EngineService, _ remote: () -> RemoteEngineService?,
                        _ out: (String) -> Void) throws {
         let p = try parse(args, switches: ["--json"])
@@ -223,7 +226,9 @@ public enum CLI {
         if p.switches.contains("--json") {
             out(json(["state": s.state, "detail": s.detail, "folders": s.folders, "files": s.files, "segments": s.segments,
                       "queue": ["queued": s.queue.queued, "running": s.queue.running, "failed": s.queue.failed],
-                      "photos": s.photos, "kinds": s.kinds, "failedFiles": s.failedFiles.map { ["path": $0.path, "note": $0.note] }]))
+                      "photos": s.photos, "kinds": s.kinds, "failedFiles": s.failedFiles.map { ["path": $0.path, "note": $0.note] },
+                      "skippedFiles": s.skippedFiles.prefix(StatusReport.skippedListLimit).map { ["path": $0.path, "note": $0.note] },
+                      "skippedFilesTotal": max(s.skippedFilesTotal, s.skippedFiles.count)]))
             return
         }
         if viaApp { out("app: \(s.state)" + (s.detail.isEmpty ? "" : " (\(s.detail))")) }
@@ -234,6 +239,12 @@ public enum CLI {
         if !s.kinds.isEmpty { out("indexed by kind: " + s.kinds.sorted { $0.key < $1.key }.map { "\($0.key) \($0.value)" }.joined(separator: ", ")) }
         if s.photos != "off" { out("photos: \(s.photos)") }
         for f in s.failedFiles { out("  could not read: \(f.path): \(f.note)") }
+        if !s.skippedFiles.isEmpty {                         // too large, minified, generated, not text, secret: never failures
+            out("skipped files:")
+            for f in s.skippedFiles.prefix(skippedTextLimit) { out("  \(f.path)  \(f.note)") }
+            let more = max(s.skippedFilesTotal, s.skippedFiles.count) - min(s.skippedFiles.count, skippedTextLimit)
+            if more > 0 { out("  (+\(more) more)") }
+        }
     }
 
     static func forget(_ args: [String], _ service: () throws -> EngineService, _ out: (String) -> Void) throws {

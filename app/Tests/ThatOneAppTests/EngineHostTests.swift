@@ -112,6 +112,18 @@ final class EngineHostTests: XCTestCase {
         XCTAssertEqual(status.queue, ServiceQueue(queued: 0, running: 0, failed: 0))
     }
 
+    func testStatusCarriesSkippedFilesWithTheirReasons() async throws {
+        let s = try setup()
+        defer { s.host.stop() }
+        try s.engine.store.upsertFile(path: "/elsewhere/app.min.js", contentId: nil, kind: "code", size: 1, mtime: 1,
+                                      status: "skipped", note: "minified")
+        s.host.start()
+        _ = await eventually { s.host.snapshot.state == .idle && s.host.snapshot.files["indexed"] == 3 }
+        let status = try s.host.status()
+        XCTAssertEqual(status.skippedFiles, [ServiceFailedFile(path: "/elsewhere/app.min.js", note: "minified")])
+        XCTAssertEqual(status.skippedFilesTotal, 1)
+    }
+
     func testSearchThroughTheServiceFindsIndexedImages() async throws {
         let s = try setup()
         defer { s.host.stop() }

@@ -74,3 +74,4 @@ Notes on Code (M5), not steps to check:
 
 - A watched folder inside a repository (for example `~/repo/src` added on its own) reads only the `.gitignore` files at and below that folder, not the one at the repository root. Add the repository root as the watched folder to have its root `.gitignore` respected.
 - Once M5 has opened the database, an older app cannot open it: the schema is now version 3 and there is no rollback. Going back to an earlier build means removing the index and indexing again.
+- Code files indexed before the doc-comment chunking change keep their old chunks until the file changes; to refresh them, switch Code off and on in Settings (it re-scans).

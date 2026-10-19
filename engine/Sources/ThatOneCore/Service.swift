@@ -75,9 +75,13 @@ public struct ServiceStatus: Codable, Equatable {
     public var failedFiles: [ServiceFailedFile]
     public var photos: String           // off | needs permission | denied | restricted | on | on (limited)
     public var kinds: [String: Int]     // indexed files per kind (image, pdf, document, text)
+    public var skippedFiles: [ServiceFailedFile]   // the first 200 skipped files by path, with why (note)
+    public var skippedFilesTotal: Int
     public init(state: String, detail: String, folders: [String], files: [String: Int], segments: [String: Int],
-                queue: ServiceQueue, failedFiles: [ServiceFailedFile], photos: String = "off", kinds: [String: Int] = [:]) {
+                queue: ServiceQueue, failedFiles: [ServiceFailedFile], photos: String = "off", kinds: [String: Int] = [:],
+                skippedFiles: [ServiceFailedFile] = [], skippedFilesTotal: Int = 0) {
         self.kinds = kinds
+        self.skippedFiles = skippedFiles; self.skippedFilesTotal = skippedFilesTotal
         self.state = state; self.detail = detail; self.folders = folders; self.files = files
         self.segments = segments; self.queue = queue; self.failedFiles = failedFiles; self.photos = photos
     }
@@ -93,6 +97,8 @@ public struct ServiceStatus: Codable, Equatable {
         failedFiles = try c.decode([ServiceFailedFile].self, forKey: .failedFiles)
         photos = try c.decodeIfPresent(String.self, forKey: .photos) ?? "off"      // older apps do not send it
         kinds = try c.decodeIfPresent([String: Int].self, forKey: .kinds) ?? [:]
+        skippedFiles = try c.decodeIfPresent([ServiceFailedFile].self, forKey: .skippedFiles) ?? []     // older apps do not send them
+        skippedFilesTotal = try c.decodeIfPresent(Int.self, forKey: .skippedFilesTotal) ?? 0
     }
 }
 
@@ -133,7 +139,9 @@ public final class LocalEngineService: EngineService {
                              segments: s.counts.segmentsByModality,
                              queue: ServiceQueue(queued: s.queue.queued, running: s.queue.running, failed: s.queue.failed),
                              failedFiles: s.failedFiles.map { ServiceFailedFile(path: $0.path, note: $0.note) },
-                             kinds: s.counts.filesByKind)
+                             kinds: s.counts.filesByKind,
+                             skippedFiles: s.skippedFiles.map { ServiceFailedFile(path: $0.path, note: $0.note) },
+                             skippedFilesTotal: s.skippedFilesTotal)
     }
 
     public func index(folders: [String]) throws -> Int {

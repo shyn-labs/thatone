@@ -16,6 +16,7 @@ public struct SearchResponse {
 }
 
 public struct IndexingSummary: Equatable {
+    /// `failed` counts files, not attempts (a file retried after its back-off and failing again counts once).
     public var indexed = 0, linked = 0, unchanged = 0, removed = 0, skipped = 0, failed = 0
     public var retryPending = 0
     public var deferred = 0
@@ -29,6 +30,10 @@ public struct StatusReport {
     public let counts: StoreCounts
     public let queue: QueueCounts
     public let failedFiles: [(path: String, note: String)]
+    /// The first `skippedListLimit` skipped files by path, and how many are skipped in all.
+    public var skippedFiles: [(path: String, note: String)] = []
+    public var skippedFilesTotal = 0
+    public static let skippedListLimit = 200
 }
 
 /// The watched folders, readable from the indexing thread while another thread changes them.
@@ -187,6 +192,8 @@ public final class Engine {
     private let transcriber: Transcriber?
     private let frameCutter: FrameCutting
     let frameDeferrals = FrameDeferrals()
+    /// Files whose OCR ran past its deadline in this process (see `OCRTimeoutBreaker`); cleared by `retryFailed`.
+    let ocrTimeouts = OCRTimeoutBreaker()
     // Paths removed or excluded while indexing or scanning was running: forgotten again once the work in flight lands.
     private var pendingForgets: [String] = []
     // The batch claimed by `runIndexing` and not yet finished, so a normal quit can put it back (`releaseClaimed`).
@@ -227,7 +234,7 @@ public final class Engine {
         let codeExclusions = CodeExclusions()
         self.codeExclusions = codeExclusions
         self.indexer = Engine.makeIndexer(store: store, embedder: lazy, paths: paths, exclusions: exclusions, codeExclusions: codeExclusions, roots: roots, ocr: ocr, assets: gated, kinds: kinds,
-                                      transcriber: transcriber, frameCutter: frameCutter, shouldContinue: { [stopFlag] in stopFlag.shouldContinue() })
+                                      transcriber: transcriber, frameCutter: frameCutter, ocrTimeouts: ocrTimeouts, shouldContinue: { [stopFlag] in stopFlag.shouldContinue() })
         self.crawler = Crawler(store: store, queue: queue, exclusions: exclusions, enabledKinds: { kinds.enabled }, unavailableKinds: { kinds.unavailable },
                                codeExclusions: codeExclusions)
     }
@@ -248,11 +255,11 @@ public final class Engine {
     private static func makeIndexer(store: Store, embedder: Embedder, paths: Paths, exclusions: Exclusions,
                                     codeExclusions: CodeExclusions, roots: RootsBox, ocr: ((CGImage) throws -> String)?, assets: AssetProvider?,
                                     kinds: KindsBox, transcriber: Transcriber?, frameCutter: FrameCutting,
-                                    shouldContinue: @escaping () -> Bool) -> Indexer {
+                                    ocrTimeouts: OCRTimeoutBreaker, shouldContinue: @escaping () -> Bool) -> Indexer {
         Indexer(store: store, embedder: embedder, workDir: paths.work, exclusions: exclusions, codeExclusions: codeExclusions,
                 roots: { roots.roots }, ocr: ocr ?? { try OCR.text(in: $0) }, assets: assets,
                 enabledKinds: { kinds.enabled }, unavailableKinds: { kinds.unavailable }, transcriber: transcriber,
-                frameCutter: frameCutter, shouldContinue: shouldContinue)
+                frameCutter: frameCutter, ocrTimeouts: ocrTimeouts, shouldContinue: shouldContinue)
     }
 
     static func sidecarEmbedder(config: Config) -> SidecarEmbedder {
@@ -281,7 +288,7 @@ public final class Engine {
         exclusions = Exclusions(extraPrefixes: _config.exclude)
         indexer = Engine.makeIndexer(store: store, embedder: embedder, paths: paths, exclusions: exclusions,
                                      codeExclusions: codeExclusions, roots: rootsBox, ocr: ocr, assets: assets, kinds: kindsBox,
-                                     transcriber: transcriber, frameCutter: frameCutter, shouldContinue: { [stopFlag] in stopFlag.shouldContinue() })
+                                     transcriber: transcriber, frameCutter: frameCutter, ocrTimeouts: ocrTimeouts, shouldContinue: { [stopFlag] in stopFlag.shouldContinue() })
         crawler = Crawler(store: store, queue: queue, exclusions: exclusions, enabledKinds: { [kindsBox] in kindsBox.enabled },
                           unavailableKinds: { [kindsBox] in kindsBox.unavailable }, codeExclusions: codeExclusions)
     }
@@ -502,6 +509,8 @@ public final class Engine {
         for path in try queue.recoverRunning() { try recordFailure(path, message: JobQueue.crashNote) }
         var summary = IndexingSummary()
         var done = 0
+        // Files, not attempts: a failed file comes back after its back-off and may fail again in a long run.
+        var failedPaths = Set<String>()
         while true {
             try drainForgets()
             // Checked and claimed under `claimLock`: a quit that has already released the batch cannot see a new one claimed.
@@ -527,19 +536,22 @@ public final class Engine {
                     try recordFailure(path, message: message)
                     try queue.fail(path: path, error: message)
                     landed(path)
-                    summary.failed += 1
+                    failedPaths.insert(path)
                     continue
                 }
                 if case .deferred = outcome {} else { frameDeferrals.clear(path) }
+                if case .failed = outcome {} else { failedPaths.remove(path) }     // it got further this time
                 switch outcome {
-                case .failed(let message): try queue.fail(path: path, error: message); landed(path); summary.failed += 1; continue
+                case .failed(let message): try queue.fail(path: path, error: message); landed(path); failedPaths.insert(path); continue
                 case .deferred(let reason):
                     // Only this file's kind waits (no speech model, no frame cutting): images and PDFs go on.
                     let kindOnly = reason.hasPrefix("transcription unavailable") || reason.hasPrefix(Indexer.frameCuttingUnavailable)
+                    // Text recognition refused (stuck Vision calls): only files that need OCR wait; the run goes on.
+                    let ocrBusy = reason.hasPrefix(Indexer.ocrUnavailable)
                     try queue.requeue(path: path, delaySeconds: kindOnly ? Engine.deferDelaySeconds * 10 : Engine.deferDelaySeconds)
                     landed(path)
                     summary.deferred += 1
-                    if summary.pausedReason == nil, !kindOnly, reason != "paused" { summary.pausedReason = reason }   // "paused": the loop sees shouldContinue
+                    if summary.pausedReason == nil, !kindOnly, !ocrBusy, reason != "paused" { summary.pausedReason = reason }   // "paused": the loop sees shouldContinue
                     continue
                 case .indexed: summary.indexed += 1
                 case .linked: summary.linked += 1
@@ -555,6 +567,7 @@ public final class Engine {
             progress?(done, try queue.counts().queued)
             if summary.pausedReason != nil { break }       // every remaining file would defer too
         }
+        summary.failed = failedPaths.count
         // Jobs waiting out a back-off. Those left for another process are not: counting them would wake a process
         // without the speech model every minute for jobs it never takes.
         summary.retryPending = try queue.claimableCount(skippingExtensions: ownedElsewhere())
@@ -588,6 +601,7 @@ public final class Engine {
         try queue.retryFailed()
         frameCutter.resetBreaker()
         frameDeferrals.clearAll()
+        ocrTimeouts.reset()
     }
 
     /// Shows a file the engine gave up on as failed (the indexer records its own failures; this is for the engine's).
@@ -663,7 +677,8 @@ public final class Engine {
     }
 
     public func status() throws -> StatusReport {
-        StatusReport(folders: config.folders, counts: try store.counts(), queue: try queue.counts(),
-                     failedFiles: try store.failedFiles())
+        let skipped = try store.skippedFiles(limit: StatusReport.skippedListLimit)
+        return StatusReport(folders: config.folders, counts: try store.counts(), queue: try queue.counts(),
+                            failedFiles: try store.failedFiles(), skippedFiles: skipped.files, skippedFilesTotal: skipped.total)
     }
 }

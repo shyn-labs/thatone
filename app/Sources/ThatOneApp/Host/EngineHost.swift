@@ -15,6 +15,8 @@ public struct HostSnapshot: Equatable {
     public var segments: [String: Int] = [:]
     public var queue = ServiceQueue(queued: 0, running: 0, failed: 0)
     public var failedFiles: [ServiceFailedFile] = []
+    public var skippedFiles: [ServiceFailedFile] = []     // the first 200 by path, with why
+    public var skippedFilesTotal = 0
     public var hotKeyProblem: String?
     public var photos: PhotosState = .off
     public var photosCount = 0
@@ -217,6 +219,8 @@ public final class EngineHost: EngineService {
             $0.segments = s.counts.segmentsByModality
             $0.queue = ServiceQueue(queued: s.queue.queued, running: s.queue.running, failed: s.queue.failed)
             $0.failedFiles = s.failedFiles.map { ServiceFailedFile(path: $0.path, note: $0.note) }
+            $0.skippedFiles = s.skippedFiles.map { ServiceFailedFile(path: $0.path, note: $0.note) }
+            $0.skippedFilesTotal = s.skippedFilesTotal
             $0.kinds = s.counts.filesByKind
         }
         lock.lock(); let enabledKinds = desiredKinds; lock.unlock()
@@ -374,7 +378,8 @@ public final class EngineHost: EngineService {
         case .paused(let reason): (state, detail) = ("paused", reason)
         }
         return ServiceStatus(state: state, detail: detail, folders: s.folders, files: s.files, segments: s.segments,
-                             queue: s.queue, failedFiles: s.failedFiles, photos: s.photos.label, kinds: s.kinds)
+                             queue: s.queue, failedFiles: s.failedFiles, photos: s.photos.label, kinds: s.kinds,
+                             skippedFiles: s.skippedFiles, skippedFilesTotal: s.skippedFilesTotal)
     }
 
     public func index(folders: [String]) throws -> Int {

@@ -100,11 +100,23 @@ public enum ImagePrep {
 }
 
 public enum OCR {
-    /// Recognised text in reading order, joined by spaces. Empty string when nothing is found.
+    /// One for the whole process, so the cap on stuck Vision calls holds across every indexer and reader.
+    /// Replaceable only by tests (to prove the default paths use it).
+    static var shared = BoundedOCR()
+
+    /// Recognised text in reading order, joined by spaces. Empty string when nothing is found. Bounded in time:
+    /// throws `ReadFailure.timedOut` when Vision takes longer than `BoundedOCR.defaultDeadline`, and `OCRUnavailable`
+    /// when too many earlier calls are still stuck (see `BoundedOCR`).
     public static func text(in image: CGImage) throws -> String {
+        try shared.text(in: image)
+    }
+
+    /// The Vision call itself, unbounded; `cancellation` cancels the request.
+    public static func vision(_ image: CGImage, _ cancellation: OCRCancellation) throws -> String {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true
+        cancellation.onCancel { request.cancel() }
         try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
         let lines = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
         return lines.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)

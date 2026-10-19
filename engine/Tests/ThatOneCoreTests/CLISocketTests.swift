@@ -61,7 +61,7 @@ final class CLISocketTests: XCTestCase {
         let r = run(["index", folder.path], home: home)
         XCTAssertEqual(r.code, 0, r.err.joined())
         XCTAssertEqual(fake.indexedFolders, [[folder.path]])
-        XCTAssertTrue(r.out.contains { $0.contains("queued 3 image(s)") }, "\(r.out)")
+        XCTAssertTrue(r.out.contains { $0.contains("queued 3 file(s)") }, "\(r.out)")
         XCTAssertTrue(r.out.joined(separator: "\n").contains("indexed 2"), "\(r.out)")
     }
 
