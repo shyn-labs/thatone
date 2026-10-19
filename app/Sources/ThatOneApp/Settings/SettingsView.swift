@@ -12,6 +12,7 @@ struct SettingsView: View {
     @State private var photosCount: Int
     @State private var photosEnabled: Bool
     @State private var kinds: Set<String>
+    @State private var editor: String
     private let refresh = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     init(model: AppModel) {
@@ -23,6 +24,7 @@ struct SettingsView: View {
         _photosCount = State(initialValue: model.host.snapshot.photosCount)
         _photosEnabled = State(initialValue: model.host.snapshot.photosEnabled)
         _kinds = State(initialValue: model.host.snapshot.enabledKinds)
+        _editor = State(initialValue: model.editorChoice)
     }
 
     var body: some View {
@@ -49,6 +51,13 @@ struct SettingsView: View {
                     }))
                     if let note = entry.note { Text(note).font(.caption).foregroundStyle(.secondary) }
                 }
+            }
+            Section("Code") {
+                Picker("Open code in", selection: $editor) {
+                    Text("VS Code").tag("vscode"); Text("Zed").tag("zed"); Text("Default app").tag("default")
+                }
+                .onChange(of: editor) { _, id in model.setEditor(id) }
+                Text("Opens at the matching line; falls back to the default app when the editor is not installed.").font(.caption).foregroundStyle(.secondary)
             }
             Section("Apple Photos") {
                 Toggle("Include my Apple Photos", isOn: Binding(get: { photosEnabled || photos == .needsPermission },

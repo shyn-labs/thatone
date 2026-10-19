@@ -32,7 +32,7 @@ final class KindsTests: XCTestCase {
 
     func testPlainTextLikeFilesAreOffByDefault() {
         XCTAssertEqual(Kinds.defaultEnabled, ["image", "pdf", "document"])
-        XCTAssertEqual(Set(Kinds.all), ["image", "pdf", "document", "text", "audio", "video"])
+        XCTAssertEqual(Set(Kinds.all), ["image", "pdf", "document", "text", "audio", "video", "code"])
         XCTAssertEqual(Config().kinds, Kinds.defaultEnabled)
     }
 

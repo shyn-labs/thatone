@@ -10,7 +10,7 @@ final class KindSwitchTests: XCTestCase {
     }
 
     func testTextLikeFilesCarryAWarningAndTheSwitchesCoverEveryKind() {
-        XCTAssertEqual(KindSwitch.all.map { $0.kind }, ["image", "pdf", "document", "audio", "video", "text"])
+        XCTAssertEqual(KindSwitch.all.map { $0.kind }, ["image", "pdf", "document", "audio", "video", "text", "code"])
         XCTAssertNotNil(KindSwitch.all.first { $0.kind == "text" }?.note)
         XCTAssertNil(KindSwitch.all.first { $0.kind == "pdf" }?.note)
     }

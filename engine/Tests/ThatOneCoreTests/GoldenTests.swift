@@ -48,4 +48,28 @@ final class GoldenTests: XCTestCase {
         XCTAssertTrue(Golden.format(summary).contains("image"))
         XCTAssertTrue(Golden.format(summary).contains("q3"))
     }
+
+    func testGoldenKindsReachCodeAndSearchesAreTimed() throws {
+        let repo = TestSupport.tempDir("repo")
+        CodeIndexingTests.write(CodeIndexingTests.source, "src/retry.swift", in: repo)
+        let e = try CodeIndexingTests.makeEngine()
+        try CodeIndexingTests.indexAll(e, repo)
+        let path = RealPath.of(repo.path) + "/src/retry.swift"
+        let queries = [GoldenQuery(id: "c1", query: "retryWithBackoff", tag: "code", relevant: [path], kinds: ["code"]),
+                       GoldenQuery(id: "c2", query: "retryWithBackoff", tag: "code", relevant: [path])]      // default search: hidden
+        let summary = try Golden.evaluate(engine: e, queries: queries)
+        XCTAssertEqual(summary.byTag["code"], EvalCell(hit10: 0.5, mrr: 0.5, n: 2))
+        XCTAssertEqual(summary.misses, ["c2"])
+        XCTAssertEqual(summary.searchMs.count, 2)
+        XCTAssertTrue(Golden.format(summary).contains("p95"))
+        let url = TestSupport.tempDir().appendingPathComponent("g.json")
+        try Data(#"[{"id":"q1","query":"a","tag":"code","relevant":["/x.ts"],"kinds":["code"],"lines":"3-14"},{"id":"q2","query":"b","tag":"image","relevant":["/y.png"]}]"#.utf8).write(to: url)
+        XCTAssertEqual(try Golden.load(url).map { $0.kinds }, [["code"], nil])
+    }
+
+    func testPercentile() {
+        XCTAssertEqual(Golden.percentile([5, 1, 3, 2, 4], 0.95), 5)
+        XCTAssertEqual(Golden.percentile([5, 1, 3, 2, 4], 0.5), 3)
+        XCTAssertEqual(Golden.percentile([], 0.95), 0)
+    }
 }

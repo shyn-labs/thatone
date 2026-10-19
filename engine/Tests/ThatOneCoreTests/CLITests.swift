@@ -142,4 +142,23 @@ final class CLITests: XCTestCase {
         XCTAssertTrue(r.out.contains { $0.contains("paused: embedding unavailable: offline") }, "\(r.out)")
         XCTAssertTrue(r.out.contains { $0.contains("failed 0") })
     }
+
+    func testCLISearchShowsCodeOnlyWithKindCode() throws {
+        let home = TestSupport.tempDir("home")
+        let repo = TestSupport.tempDir("repo")
+        try Config(kinds: ["code"]).save(to: Paths(home: home).config)
+        CodeIndexingTests.write(CodeIndexingTests.source, "src/retry.swift", in: repo)
+        let fake = FakeEmbedder()
+        XCTAssertEqual(run(["index", repo.path], home: home, embedder: fake).code, 0)
+        func hits(_ args: [String]) throws -> [[String: Any]] {
+            let r = run(["search", "retryWithBackoff", "--json"] + args, home: home, embedder: fake)
+            XCTAssertEqual(r.code, 0)
+            return (try JSONSerialization.jsonObject(with: Data(r.out.joined(separator: "\n").utf8)) as! [String: Any])["hits"] as! [[String: Any]]
+        }
+        XCTAssertEqual(try hits([]).count, 0)
+        let code = try hits(["--kind", "code"])
+        XCTAssertEqual(code.count, 1)
+        XCTAssertEqual(code[0]["kind"] as? String, "code")
+        XCTAssertTrue((code[0]["anchors"] as! [[String: Any]]).contains { ($0["anchor"] as? String)?.contains("\"line0\":3") == true })
+    }
 }

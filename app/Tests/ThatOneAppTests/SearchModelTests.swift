@@ -32,7 +32,9 @@ private func hit(_ path: String) -> ServiceHit { FakeSearching.hit(path) }
 
 final class FakeActions: FileActioning {
     private(set) var opened: [String] = [], revealed: [String] = [], copied: [String] = []
-    func open(_ path: String) { opened.append(path) }
+    private(set) var openedAt: [(kind: String, line: Int?)] = []
+    var openSucceeds = true
+    func open(_ path: String, kind: String, line: Int?) -> Bool { opened.append(path); openedAt.append((kind, line)); return openSucceeds }
     func reveal(_ path: String) { revealed.append(path) }
     func copyPath(_ path: String) { copied.append(path) }
 }
@@ -42,6 +44,48 @@ final class SearchModelTests: XCTestCase {
     func make(_ engine: FakeSearching = FakeSearching(), debounce: Duration = .milliseconds(30)) -> (SearchModel, FakeSearching, FakeActions) {
         let actions = FakeActions()
         return (SearchModel(engine: engine, actions: actions, debounce: debounce, limit: 30, home: "/Users/me"), engine, actions)
+    }
+
+    private func codeEngine() -> FakeSearching {
+        let engine = FakeSearching()
+        engine.result = { _ in ServiceSearchResult(hits: [ServiceHit(paths: ["/tmp/r/a.ts"], kind: "code", score: 1, modified: 0, anchors: [
+            ServiceAnchor(modality: "text", anchor: #"{"line0":12,"line1":30}"#, text: "x", viaKeyword: true, viaVector: false)])], notice: nil) }
+        return engine
+    }
+
+    func testOpenPassesKindAndLineAndAFailureShowsANotice() async {
+        let (model, _, actions) = make(codeEngine())
+        var activated = 0
+        model.onActivated = { activated += 1 }
+        model.query = "retry"
+        let found = await eventually { model.rows.count == 1 }
+        XCTAssertTrue(found)
+        model.perform(.open)
+        XCTAssertEqual(actions.openedAt.first?.kind, "code")
+        XCTAssertEqual(actions.openedAt.first?.line, 12)
+        XCTAssertEqual(activated, 1)
+        actions.openSucceeds = false
+        model.perform(.open)
+        XCTAssertEqual(model.notice, "Couldn't open a.ts")
+        XCTAssertEqual(activated, 1)
+    }
+
+    /// The big window opens through the same model path, so its failures show the same notice (and it never dismisses a panel).
+    func testOpeningARowFromTheBigWindowPathShowsTheNoticeOnFailure() async {
+        let (model, _, actions) = make(codeEngine())
+        var activated = 0
+        model.onActivated = { activated += 1 }
+        model.query = "retry"
+        let found = await eventually { model.rows.count == 1 }
+        XCTAssertTrue(found)
+        let row = model.rows[0]
+        model.open(row)
+        XCTAssertNil(model.notice)
+        XCTAssertEqual(actions.openedAt.first?.line, 12)
+        actions.openSucceeds = false
+        model.open(row)
+        XCTAssertEqual(model.notice, "Couldn't open a.ts")
+        XCTAssertEqual(activated, 0)
     }
 
     func testRefreshBrowsesAndTypingSearches() async {
@@ -111,6 +155,8 @@ final class SearchModelTests: XCTestCase {
         XCTAssertEqual(model.kind, .audio)
         model.perform(.cycleKind)
         XCTAssertEqual(model.kind, .video)
+        model.perform(.cycleKind)
+        XCTAssertEqual(model.kind, .code)
         model.perform(.cycleKind)
         XCTAssertEqual(model.kind, .all)
         let searched = await eventually { engine.specs.last?.kinds == [] }      // the last filter state is what ran
@@ -248,12 +294,13 @@ final class ResultRowTests: XCTestCase {
         XCTAssertEqual(KindFilter.pdf.next(), .document)
         XCTAssertEqual(KindFilter.document.next(), .audio)
         XCTAssertEqual(KindFilter.audio.next(), .video)
-        XCTAssertEqual(KindFilter.video.next(), .all)
+        XCTAssertEqual(KindFilter.video.next(), .code)
+        XCTAssertEqual(KindFilter.code.next(), .all)
         XCTAssertEqual(KindFilter.video.kinds, ["video"])
         XCTAssertEqual(KindFilter.audio.kinds, ["audio"])
         XCTAssertEqual(KindFilter.all.kinds, [])
         XCTAssertEqual(KindFilter.pdf.kinds, ["pdf"])
         XCTAssertEqual(KindFilter.document.kinds, ["document"])
-        XCTAssertEqual(KindFilter.allCases.map { $0.title }, ["All", "Images", "PDFs", "Documents", "Audio", "Video"])
+        XCTAssertEqual(KindFilter.allCases.map { $0.title }, ["All", "Images", "PDFs", "Documents", "Audio", "Video", "Code"])
     }
 }

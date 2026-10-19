@@ -5,8 +5,9 @@ public struct GoldenQuery: Codable, Equatable {
     public let query: String
     public let tag: String
     public let relevant: [String]
-    public init(id: String, query: String, tag: String, relevant: [String]) {
-        self.id = id; self.query = query; self.tag = tag; self.relevant = relevant
+    public let kinds: [String]?       // searched with these kinds (code needs ["code"]); nil = a default search
+    public init(id: String, query: String, tag: String, relevant: [String], kinds: [String]? = nil) {
+        self.id = id; self.query = query; self.tag = tag; self.relevant = relevant; self.kinds = kinds
     }
 }
 
@@ -21,6 +22,7 @@ public struct EvalSummary: Equatable {
     public var overall: EvalCell
     public var misses: [String]
     public var unindexed: [String]
+    public var searchMs: [Double] = []
 }
 
 public enum Golden {
@@ -41,13 +43,18 @@ public enum Golden {
         var sums: [String: (hits: Double, rr: Double, n: Int)] = [:]
         var misses: [String] = []
         var unindexed: [String] = []
-        for q in queries where tags?.contains(q.tag) ?? true {
+        let selected = queries.filter { tags?.contains($0.tag) ?? true }
+        var times: [Double] = []
+        if let first = selected.first { _ = try? engine.search(first.query, limit: 1) }   // loads the model; not timed
+        for q in selected {
             let relevant = Set(q.relevant.map(RealPath.of))
             for path in relevant.sorted() {
                 let indexed = try engine.store.fileRecord(path: path)?.status == "indexed"
                 if !indexed { unindexed.append("\(q.id)→\(path)") }
             }
-            let response = try engine.search(q.query, limit: k)
+            let started = DispatchTime.now().uptimeNanoseconds
+            let response = try engine.search(q.query, filters: SearchFilters(kinds: Set(q.kinds ?? [])), limit: k)
+            times.append(Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000)
             let result = score(hits: response.hits.map { $0.paths }, relevant: relevant, k: k)
             if !result.hit { misses.append(q.id) }
             for key in [q.tag, "all"] {
@@ -64,7 +71,15 @@ public enum Golden {
         }
         var byTag: [String: EvalCell] = [:]
         for key in sums.keys where key != "all" { byTag[key] = cell(key) }
-        return EvalSummary(byTag: byTag, overall: cell("all"), misses: misses, unindexed: unindexed)
+        return EvalSummary(byTag: byTag, overall: cell("all"), misses: misses, unindexed: unindexed, searchMs: times)
+    }
+
+    /// The value at or below which `p` (0...1) of `values` fall; 0 for none.
+    public static func percentile(_ values: [Double], _ p: Double) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        let index = max(0, Int((p * Double(sorted.count)).rounded(.up)) - 1)
+        return sorted[min(index, sorted.count - 1)]
     }
 
     public static func format(_ summary: EvalSummary) -> String {
@@ -74,6 +89,10 @@ public enum Golden {
         }
         let o = summary.overall
         lines.append(String(format: "%-10@ %.3f    %.3f   %d", "all" as NSString, o.hit10, o.mrr, o.n))
+        if !summary.searchMs.isEmpty {
+            lines.append(String(format: "search ms: p50 %.0f, p95 %.0f, max %.0f (n %d)", percentile(summary.searchMs, 0.5),
+                                percentile(summary.searchMs, 0.95), summary.searchMs.max() ?? 0, summary.searchMs.count))
+        }
         if !summary.misses.isEmpty { lines.append("misses: " + summary.misses.joined(separator: ", ")) }
         if !summary.unindexed.isEmpty { lines.append("relevant files with no indexed row (guaranteed misses): " + summary.unindexed.joined(separator: ", ")) }
         return lines.joined(separator: "\n")

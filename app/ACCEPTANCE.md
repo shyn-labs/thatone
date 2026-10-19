@@ -59,3 +59,18 @@ Install first: `app/scripts/build-app.sh --install`, then open `~/Applications/T
 43. Memory: with Video indexing a big library, open heavy apps until macOS shows memory pressure: indexing pauses and resumes by itself. A very long video (an hour or more) finishes without the Mac stalling.
 
 44. Transcript chunks now split at silences longer than 8 s, so a time chip for a phrase after a long pause points at that phrase, not at the start of an earlier one. Recordings and videos indexed before 2026-10-16 keep their old merged chunks until the file changes: to refresh one, switch its kind (Audio or Video) off and on in Settings, which re-scans it.
+
+## Code (M5)
+
+45. Settings > What to index: "Code" is off by default with the note "Respects .gitignore; hidden from normal searches unless you pick Code". Switch it on with a watched folder that holds a repository: the menu shows "N code files"; nothing from `node_modules`, `.git`, build folders (`build`, `dist`, `.build`, `DerivedData`, …) or gitignored paths appears.
+46. Search for something a function does: a normal search shows no code. Tab to Code (or pick Code in the big window): code results show the </> icon and an "L12–48" chip; the preview (Space or ⌘Y) shows those lines numbered in a monospaced font.
+47. ↩ on a code result opens VS Code at that line (or Zed when Settings > Code > "Open code in" says Zed); with "Default app" (or the editor not installed) the file opens in its default app; ⌘↩ reveals it in Finder. Other kinds open exactly as before.
+48. Add a folder name to a repository's `.gitignore`: its code results disappear within a minute; remove the line: they come back after the next indexing pass. Images in that folder are unaffected.
+49. `thatone search "<words>" --kind code` returns code with line anchors; without `--kind code` no code appears; `thatone status` lists minified, generated and over-1 MB files as skipped, never as failed.
+50. Switch Code off: every code result disappears at once; switch it on again: they come back after a scan.
+51. After a later shyn release only: Claude's `search_files` with `kinds: ["code"]` returns paths with a `lines:` line; without it, no code.
+
+Notes on Code (M5), not steps to check:
+
+- A watched folder inside a repository (for example `~/repo/src` added on its own) reads only the `.gitignore` files at and below that folder, not the one at the repository root. Add the repository root as the watched folder to have its root `.gitignore` respected.
+- Once M5 has opened the database, an older app cannot open it: the schema is now version 3 and there is no rollback. Going back to an earlier build means removing the index and indexing again.

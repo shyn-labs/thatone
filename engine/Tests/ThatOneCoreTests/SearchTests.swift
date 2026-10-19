@@ -174,4 +174,110 @@ final class SearchTests: XCTestCase {
         XCTAssertEqual(try searcher.similar(toContentId: id, limit: Int.max), [])
         XCTAssertEqual(try searcher.similar(toContentId: id, limit: -3), [])
     }
+
+    func testCodeIsLeftOutUnlessASearchNamesIt() throws {
+        let s = try makeStore()
+        let img = try add(s, hash: "i", paths: ["/p/a.png"], segments: [("text", "retry backoff photo", [1, 0, 0, 0])])
+        let code = try add(s, hash: "c", paths: ["/r/retry.ts"], kind: "code", segments: [("text", "retry backoff", [1, 0, 0, 0])])
+        let searcher = Searcher(store: s)
+        XCTAssertEqual(try searcher.search(query: "retry", queryVector: [1, 0, 0, 0]).map { $0.contentId }, [img])
+        XCTAssertEqual(try searcher.search(query: "retry", queryVector: [1, 0, 0, 0], filters: SearchFilters(kinds: ["code"])).map { $0.contentId }, [code])
+        XCTAssertEqual(Set(try searcher.search(query: "retry", queryVector: [1, 0, 0, 0],
+                                               filters: SearchFilters(kinds: ["code", "image"])).map { $0.contentId }), [img, code])
+        XCTAssertEqual(try searcher.search(query: "retry", queryVector: nil, filters: SearchFilters(folder: "/r")).count, 0)
+        XCTAssertEqual(try searcher.recent().map { $0.contentId }, [img])
+        XCTAssertEqual(try searcher.recent(filters: SearchFilters(kinds: ["code"])).map { $0.contentId }, [code])
+        XCTAssertEqual(try searcher.similar(toContentId: img).map { $0.contentId }, [])
+        XCTAssertEqual(try searcher.similar(toContentId: img, filters: SearchFilters(kinds: ["code"])).map { $0.contentId }, [code])
+    }
+
+    func testALargeCodeIndexDoesNotPushOtherKindsOutOfADefaultSearch() throws {
+        let s = try makeStore()
+        for n in 0..<450 {        // more code segments nearer to the query than the whole vector pool (100 x 4)
+            try add(s, hash: "c\(n)", paths: ["/r/f\(n).ts"], kind: "code", segments: [("text", "", [1, 0.001 * Float(n), 0, 0])])
+        }
+        let img = try add(s, hash: "i", paths: ["/p/a.png"], segments: [("image", "", [0.5, 0.5, 0.5, 0.5])])
+        XCTAssertEqual(try Searcher(store: s).search(query: "", queryVector: [1, 0, 0, 0]).map { $0.contentId }, [img])
+    }
+
+    func testCodeKeywordHitsDoNotCrowdTheKeywordPool() throws {
+        let s = try makeStore()
+        for n in 0..<150 {        // more keyword hits than the keyword pool (100), each scoring higher than the image
+            try add(s, hash: "k\(n)", paths: ["/r/k\(n).ts"], kind: "code", segments: [("text", "invoice invoice invoice", [0, 0, 0, 1])])
+        }
+        let img = try add(s, hash: "i", paths: ["/p/a.png"], segments: [("text", "invoice total due in thirty days", [0, 0, 1, 0])])
+        XCTAssertEqual(try Searcher(store: s).search(query: "invoice", queryVector: nil).map { $0.contentId }, [img])
+    }
+
+    func testMoreLikeThisFromCodeReturnsCodeAndFromAnImageReturnsNone() throws {
+        let s = try makeStore()
+        let img = try add(s, hash: "i", paths: ["/p/a.png"], segments: [("image", "", [1, 0, 0, 0])])
+        let code = try add(s, hash: "c", paths: ["/r/retry.ts"], kind: "code", segments: [("text", "retry", [1, 0, 0, 0])])
+        let other = try add(s, hash: "d", paths: ["/r/backoff.ts"], kind: "code", segments: [("text", "backoff", [0.9, 0.1, 0, 0])])
+        let searcher = Searcher(store: s)
+        XCTAssertEqual(try searcher.similar(toContentId: code).map { $0.contentId }, [other])          // the source's hidden kind is named
+        XCTAssertEqual(try searcher.similar(toContentId: img).map { $0.contentId }, [])               // unchanged: no code
+        XCTAssertEqual(try searcher.similar(toContentId: code, filters: SearchFilters(kinds: ["image"])).map { $0.contentId }, [img])
+    }
+
+    func testANamedKindSearchIsNotCrowdedByHiddenKindsItDoesNotName() throws {
+        let s = try makeStore()
+        try s.transaction {
+            for n in 0..<2000 {   // more code nearer to the query than a named-kind vector fetch (400 x 4), and more keyword
+                                  // hits, each outscoring the image, than any widened keyword fetch (400 x 4) would reach
+                try add(s, hash: "c\(n)", paths: ["/r/f\(n).ts"], kind: "code",
+                        segments: [("text", "invoice invoice invoice", [1, 0.0001 * Float(n), 0, 0])])
+            }
+        }
+        let img = try add(s, hash: "i", paths: ["/p/a.png"], segments: [("image", "invoice total due", [0.5, 0.5, 0.5, 0.5])])
+        let searcher = Searcher(store: s)
+        let images = SearchFilters(kinds: ["image"])
+        XCTAssertEqual(try searcher.search(query: "", queryVector: [1, 0, 0, 0], filters: images).map { $0.contentId }, [img])
+        XCTAssertEqual(try searcher.search(query: "invoice", queryVector: nil, filters: images).map { $0.contentId }, [img])
+        XCTAssertEqual(try searcher.search(query: "invoice", queryVector: nil).map { $0.contentId }, [img])      // default search
+    }
+
+    func testACodeOnlySearchIsNotCrowdedByOutrankingProse() throws {
+        let s = try makeStore()
+        try s.transaction {
+            for n in 0..<2000 {   // PDF segments that beat the code chunk on both sides, more than either fetch reaches
+                try add(s, hash: "p\(n)", paths: ["/docs/p\(n).pdf"], kind: "pdf",
+                        segments: [("text", "retry retry retry", [1, 0.0001 * Float(n), 0, 0])])
+            }
+        }
+        let code = try add(s, hash: "c", paths: ["/r/retry.ts"], kind: "code",
+                           segments: [("text", "export function retry(fn, attempts, delay, jitter, signal, onError, log)", [0.2, 0.9, 0.3, 0.1])])
+        let searcher = Searcher(store: s)
+        let codeOnly = SearchFilters(kinds: ["code"])
+        let keyword = try searcher.search(query: "retry", queryVector: nil, filters: codeOnly)
+        XCTAssertEqual(keyword.map { $0.contentId }, [code])
+        XCTAssertEqual(keyword.first?.anchors.first?.viaKeyword, true)
+        let vector = try searcher.search(query: "", queryVector: [1, 0, 0, 0], filters: codeOnly)
+        XCTAssertEqual(vector.map { $0.contentId }, [code])
+        XCTAssertEqual(vector.first?.anchors.first?.viaVector, true)
+        // Nothing changes for a search that names no kind: prose wins and code stays out.
+        let open = try searcher.search(query: "retry", queryVector: [1, 0, 0, 0], limit: 3)
+        XCTAssertEqual(open.map { $0.kind }, ["pdf", "pdf", "pdf"])
+    }
+
+    func testAnExistingDatabaseGainsTheContentsKindIndex() throws {
+        let path = TestSupport.tempDir().appendingPathComponent("old.db").path
+        func hasIndex(_ s: Store) throws -> Bool {
+            try s.int("select count(*) from sqlite_master where type = 'index' and name = 'contents_kind'") == 1
+        }
+        do {   // a database as the previous release left it: schema 2, no index on contents(kind)
+            let s = try Store.open(path: path, key: TestSupport.key, dim: 4)
+            try s.run("drop index contents_kind")
+            try s.run("update meta set value = '2' where key = 'schema_version'")
+            _ = try add(s, hash: "c", paths: ["/r/a.ts"], kind: "code", segments: [("text", "kept", [1, 0, 0, 0])])
+            XCTAssertFalse(try hasIndex(s))
+            s.close()
+        }
+        let s = try Store.open(path: path, key: TestSupport.key, dim: 4)
+        XCTAssertTrue(try hasIndex(s))
+        XCTAssertEqual(try s.int("select value from meta where key = 'schema_version'"), Int64(Schema.migrations.count))
+        XCTAssertEqual(try Searcher(store: s).search(query: "kept", queryVector: nil, filters: SearchFilters(kinds: ["code"])).count, 1)
+        let plan = try s.query("explain query plan select 1 from contents where status = 'indexed' and kind in ('code')") { $0.text(3) }
+        XCTAssertTrue(plan.contains { $0.contains("contents_kind") }, "\(plan)")
+    }
 }

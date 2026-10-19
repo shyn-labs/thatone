@@ -9,10 +9,13 @@ public struct Config: Codable, Equatable {
     public var photos: Bool                   // index the Apple Photos library (the app asks macOS for permission)
     public var kinds: Set<String>             // which kinds of files are indexed (see Kinds)
     public var whisperFolder: String?         // where the speech model lives (the app looks in shyn's folder when nil)
+    public var editor: String?                // how code opens: "vscode", "zed" or "default"; nil = VS Code when installed
+    public static let editors = ["vscode", "zed", "default"]
 
     public init(folders: [String] = [], exclude: [String] = [], sidecar: [String] = [], sidecarEnv: [String: String] = [:],
                 hotKey: String? = nil, photos: Bool = false, kinds: Set<String> = Kinds.defaultEnabled,
-                whisperFolder: String? = nil) {
+                whisperFolder: String? = nil, editor: String? = nil) {
+        self.editor = editor
         self.kinds = kinds
         self.whisperFolder = whisperFolder
         self.folders = folders; self.exclude = exclude; self.sidecar = sidecar; self.sidecarEnv = sidecarEnv; self.hotKey = hotKey
@@ -28,6 +31,7 @@ public struct Config: Codable, Equatable {
         hotKey = try c.decodeIfPresent(String.self, forKey: .hotKey)
         photos = try c.decodeIfPresent(Bool.self, forKey: .photos) ?? false
         whisperFolder = try c.decodeIfPresent(String.self, forKey: .whisperFolder)
+        editor = try c.decodeIfPresent(String.self, forKey: .editor).flatMap { Config.editors.contains($0) ? $0 : nil }
         let stored = try c.decodeIfPresent([String].self, forKey: .kinds)
         kinds = stored.map { Set($0).intersection(Kinds.all) } ?? Kinds.defaultEnabled     // unknown names are ignored
     }

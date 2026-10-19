@@ -103,3 +103,26 @@ def test_exif_orientation_applied(worker, tmp_path):
     upright.rotate(90, expand=True).save(tagged_path, exif=exif)
     v = vecs(worker(op="embed", modality="image", role="document", inputs=[str(up_path), str(tagged_path)]))
     assert float(v[0] @ v[1]) > 0.98
+
+
+def test_length_batched_text_matches_one_at_a_time(worker):
+    # Length-aware sub-batching must not change embeddings beyond float noise.
+    src = (Path(__file__).resolve().parents[3] / "engine/Sources/ThatOneCore/Search.swift").read_text()
+    lines = src.splitlines()
+    texts = [
+        "Mars is known as the Red Planet.",
+        "invoice",
+        "\n".join(lines[:20]),
+        "The quarterly report shows revenue grew while costs stayed flat. " * 12,
+        "\n".join(lines[:120]),
+        "\n".join((lines * 3)[40:400]),  # longer than the 2048-token cap, so truncated
+        "a short note about the tractor in the rice field",
+        "\n".join(lines[60:110]),
+    ]
+    one = np.vstack([vecs(worker(op="embed", modality="text", role="document", inputs=[t]))
+                     for t in texts])
+    batched = vecs(worker(op="embed", modality="text", role="document", inputs=texts))
+    assert batched.shape == (len(texts), 768)
+    cos = np.sum(one * batched, axis=1)  # vectors are L2-normalised by the protocol
+    print("COSINE:", " ".join(f"{c:.6f}" for c in cos))
+    assert np.all(cos >= 0.999), cos

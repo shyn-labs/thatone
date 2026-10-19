@@ -38,6 +38,7 @@ enum KindIcon {
         case "text": return "text.alignleft"
         case "audio": return "waveform"
         case "video": return "film"
+        case "code": return "chevron.left.forwardslash.chevron.right"
         default: return "photo"
         }
     }

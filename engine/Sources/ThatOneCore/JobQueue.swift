@@ -8,6 +8,10 @@ public struct QueueCounts: Equatable {
 
 public final class JobQueue {
     public static let maxAttempts = 3
+    /// The error of a job found `running` at startup: the app stopped (crashed or was quit) while reading the file.
+    public static let crashNote = "stopped the app while reading"
+    /// The priority of a purge job: the scan no longer sees the file, so its rows are dropped (it runs last).
+    public static let purgePriority = Int64.min
 
     private let store: Store
     private let clock: () -> Int64
@@ -91,9 +95,50 @@ public final class JobQueue {
         }
     }
 
-    /// After a crash or force-quit, jobs left `running` go back to the queue.
-    public func recoverRunning() throws {
-        try store.run("update jobs set state = 'queued' where state = 'running'")
+    /// After a crash or force-quit, jobs left `running` go back to the queue, each counting one attempt: the file may be
+    /// what stopped the app. A job found `running` after the previous restart already recovered it (its error is still
+    /// `crashNote`) is given up as failed with `crashNote`, as is one that reaches `maxAttempts`; it is never claimed
+    /// again until the file changes or the user retries failed files. A purge job (`purgePriority`: the file is gone)
+    /// just runs again: no attempt, no failure. A normal quit leaves nothing `running` (see `release`). Returns the paths
+    /// given up.
+    @discardableResult
+    public func recoverRunning() throws -> [String] {
+        try store.transaction {
+            try store.run("update jobs set state = 'queued' where state = 'running' and priority = ?", [.int(Self.purgePriority)])
+            let failed = try store.query(
+                "select path from jobs where state = 'running' and (last_error = ? or attempts + 1 >= ?) order by path",
+                [.text(Self.crashNote), .int(Int64(Self.maxAttempts))]) { $0.text(0) }
+            try store.run("""
+                update jobs set attempts = attempts + 1, last_error = ?,
+                    state = case when last_error = ? or attempts + 1 >= ? then 'failed' else 'queued' end
+                where state = 'running'
+                """, [.text(Self.crashNote), .text(Self.crashNote), .int(Int64(Self.maxAttempts))])
+            return failed
+        }
+    }
+
+    /// The highest-priority job recovered after a crash that has not run to the end since (still queued with
+    /// `crashNote`), claimed alone: if it stops the app again, only that file is blamed. Empty when there is none.
+    public func claimRecovered(skippingExtensions: Set<String> = []) throws -> [String] {
+        let now = clock()
+        let skip = Self.skipClause(skippingExtensions)
+        return try store.transaction {
+            let paths = try store.query(
+                "select path from jobs where state = 'queued' and last_error = ? and next_attempt <= ?" + skip.sql
+                    + " order by priority desc, path limit 1",
+                [.text(Self.crashNote), .int(now)] + skip.binds) { $0.text(0) }
+            for path in paths { try store.run("update jobs set state = 'running' where path = ?", [.text(path)]) }
+            return paths
+        }
+    }
+
+    /// Puts claimed jobs that are still `running` back in the queue as they were (attempts, error and back-off kept):
+    /// the app is quitting normally, which says nothing about the files. One short write.
+    public func release(paths: [String]) throws {
+        guard !paths.isEmpty else { return }
+        try store.transaction {
+            for path in paths { try store.run("update jobs set state = 'queued' where path = ? and state = 'running'", [.text(path)]) }
+        }
     }
 
     public func retryFailed() throws {

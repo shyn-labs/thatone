@@ -109,14 +109,21 @@ public final class SearchModel: ObservableObject {
         selection = min(max(selection + delta, 0), rows.count - 1)
     }
 
+    /// Opens a row (code at its line); a failure shows "Couldn't open <name>" for the panel and the big window alike.
+    @discardableResult
+    public func open(_ row: ResultRow) -> Bool {
+        let opened = actions.open(row.path, kind: row.kind, line: row.line)
+        if !opened { notice = "Couldn't open \(row.name)" }
+        return opened
+    }
+
     public func perform(_ command: Command) {
         switch command {
         case .up: moveSelection(by: -1)
         case .down: moveSelection(by: 1)
         case .open:
             guard let row = selectedRow else { return }
-            actions.open(row.path)
-            onActivated?()
+            if open(row) { onActivated?() }
         case .reveal: selectedRow.map { actions.reveal($0.path) }
         case .copyPath: selectedRow.map { actions.copyPath($0.path) }
         case .moreLike: moreLikeSelected()

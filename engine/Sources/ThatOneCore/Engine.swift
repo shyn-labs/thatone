@@ -7,6 +7,7 @@ public enum EngineError: Error, Equatable {
     case alreadyIndexing
     case cannotLock(String)
     case notIndexed(String)
+    case unknownEditor(String)
 }
 
 public struct SearchResponse {
@@ -176,6 +177,7 @@ public final class Engine {
     private var indexer: Indexer
     private var crawler: Crawler
     private var exclusions: Exclusions
+    private let codeExclusions: CodeExclusions
     private let rootsBox: RootsBox
     private let ocr: ((CGImage) throws -> String)?
     private let assets: GatedAssets?                 // present only when the app supplied a Photos provider
@@ -187,6 +189,11 @@ public final class Engine {
     let frameDeferrals = FrameDeferrals()
     // Paths removed or excluded while indexing or scanning was running: forgotten again once the work in flight lands.
     private var pendingForgets: [String] = []
+    // The batch claimed by `runIndexing` and not yet finished, so a normal quit can put it back (`releaseClaimed`).
+    private let claimLock = NSLock()
+    private var inFlight: [String] = []
+    /// Test seam: runs after each claim; a throw stands in for the process dying with the batch still claimed.
+    var onClaim: (([String]) throws -> Void)?
 
     public init(paths: Paths, config: Config, keyProvider: KeyProvider,
                 embedder: Embedder? = nil, ocr: ((CGImage) throws -> String)? = nil,
@@ -217,9 +224,12 @@ public final class Engine {
         let gated = assets.map { GatedAssets($0, flag: flag) }
         self.photosFlag = flag
         self.assets = gated
-        self.indexer = Engine.makeIndexer(store: store, embedder: lazy, paths: paths, exclusions: exclusions, roots: roots, ocr: ocr, assets: gated, kinds: kinds,
+        let codeExclusions = CodeExclusions()
+        self.codeExclusions = codeExclusions
+        self.indexer = Engine.makeIndexer(store: store, embedder: lazy, paths: paths, exclusions: exclusions, codeExclusions: codeExclusions, roots: roots, ocr: ocr, assets: gated, kinds: kinds,
                                       transcriber: transcriber, frameCutter: frameCutter, shouldContinue: { [stopFlag] in stopFlag.shouldContinue() })
-        self.crawler = Crawler(store: store, queue: queue, exclusions: exclusions, enabledKinds: { kinds.enabled }, unavailableKinds: { kinds.unavailable })
+        self.crawler = Crawler(store: store, queue: queue, exclusions: exclusions, enabledKinds: { kinds.enabled }, unavailableKinds: { kinds.unavailable },
+                               codeExclusions: codeExclusions)
     }
 
     public var config: Config {
@@ -236,10 +246,10 @@ public final class Engine {
     }
 
     private static func makeIndexer(store: Store, embedder: Embedder, paths: Paths, exclusions: Exclusions,
-                                    roots: RootsBox, ocr: ((CGImage) throws -> String)?, assets: AssetProvider?,
+                                    codeExclusions: CodeExclusions, roots: RootsBox, ocr: ((CGImage) throws -> String)?, assets: AssetProvider?,
                                     kinds: KindsBox, transcriber: Transcriber?, frameCutter: FrameCutting,
                                     shouldContinue: @escaping () -> Bool) -> Indexer {
-        Indexer(store: store, embedder: embedder, workDir: paths.work, exclusions: exclusions,
+        Indexer(store: store, embedder: embedder, workDir: paths.work, exclusions: exclusions, codeExclusions: codeExclusions,
                 roots: { roots.roots }, ocr: ocr ?? { try OCR.text(in: $0) }, assets: assets,
                 enabledKinds: { kinds.enabled }, unavailableKinds: { kinds.unavailable }, transcriber: transcriber,
                 frameCutter: frameCutter, shouldContinue: shouldContinue)
@@ -270,10 +280,10 @@ public final class Engine {
     private func rebuildWorkers() {
         exclusions = Exclusions(extraPrefixes: _config.exclude)
         indexer = Engine.makeIndexer(store: store, embedder: embedder, paths: paths, exclusions: exclusions,
-                                     roots: rootsBox, ocr: ocr, assets: assets, kinds: kindsBox,
+                                     codeExclusions: codeExclusions, roots: rootsBox, ocr: ocr, assets: assets, kinds: kindsBox,
                                      transcriber: transcriber, frameCutter: frameCutter, shouldContinue: { [stopFlag] in stopFlag.shouldContinue() })
         crawler = Crawler(store: store, queue: queue, exclusions: exclusions, enabledKinds: { [kindsBox] in kindsBox.enabled },
-                          unavailableKinds: { [kindsBox] in kindsBox.unavailable })
+                          unavailableKinds: { [kindsBox] in kindsBox.unavailable }, codeExclusions: codeExclusions)
     }
 
     // MARK: folders and exclusions
@@ -333,6 +343,16 @@ public final class Engine {
         stateLock.lock(); defer { stateLock.unlock() }
         var updated = _config
         updated.hotKey = id
+        try updated.save(to: paths.config)
+        _config = updated
+    }
+
+    /// Remembers which editor opens code results ("vscode", "zed", "default"); nil goes back to automatic.
+    public func setEditor(_ id: String?) throws {
+        if let id, !Config.editors.contains(id) { throw EngineError.unknownEditor(id) }
+        stateLock.lock(); defer { stateLock.unlock() }
+        var updated = _config
+        updated.editor = id
         try updated.save(to: paths.config)
         _config = updated
     }
@@ -446,14 +466,19 @@ public final class Engine {
         }
     }
 
-    /// Queues exactly these files (full exclusion rules, no root): used by `index --files-from`.
+    /// Queues exactly these files (full exclusion rules; code files also by build folder and `.gitignore`).
     public func enqueue(files: [String]) throws -> Int {
-        let rules = workers().exclusions
+        let w = workers()
+        let roots = w.folders.map(RealPath.of)
         var queued = 0
         for raw in files {
             let path = RealPath.of(raw.trimmingCharacters(in: .whitespacesAndNewlines))
-            guard let kind = Kinds.detect(path), kindsBox.enabled.contains(kind), !rules.isExcluded(path: path),
+            guard let kind = Kinds.detect(path), kindsBox.enabled.contains(kind), !w.exclusions.isExcluded(path: path),
                   FileManager.default.fileExists(atPath: path) else { continue }
+            if kind == "code" {
+                let root = roots.first { path.hasPrefix($0.hasSuffix("/") ? $0 : $0 + "/") }
+                if codeExclusions.reason(path: path, root: root) != nil { continue }
+            }
             let modified = (try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate]) as? Date
             try queue.enqueue(path: path, priority: Int64(modified?.timeIntervalSince1970 ?? 0))
             queued += 1
@@ -472,14 +497,26 @@ public final class Engine {
         defer { lock.release() }
         stopFlag.set(shouldContinue)
         defer { stopFlag.set({ true }) }
-        try queue.recoverRunning()
+        // A file that keeps stopping the app is shown as failed, so the next scan leaves it alone until it changes.
+        claimLock.lock(); inFlight = []; claimLock.unlock()          // whatever was claimed before is recovered below
+        for path in try queue.recoverRunning() { try recordFailure(path, message: JobQueue.crashNote) }
         var summary = IndexingSummary()
         var done = 0
         while true {
             try drainForgets()
-            if !shouldContinue() { summary.stopped = true; break }
-            let batch = try queue.claim(limit: batchSize, skippingExtensions: ownedElsewhere())
+            // Checked and claimed under `claimLock`: a quit that has already released the batch cannot see a new one claimed.
+            claimLock.lock()
+            if !shouldContinue() { claimLock.unlock(); summary.stopped = true; break }
+            let batch: [String]
+            do {
+                // A file recovered after a crash runs alone until it finishes once: only the culprit is blamed if it crashes again.
+                let recovered = try queue.claimRecovered(skippingExtensions: ownedElsewhere())
+                batch = recovered.isEmpty ? try queue.claim(limit: batchSize, skippingExtensions: ownedElsewhere()) : recovered
+            } catch { claimLock.unlock(); throw error }
+            inFlight = batch
+            claimLock.unlock()
             if batch.isEmpty { break }
+            try onClaim?(batch)
             let outcomes = workers().indexer.index(paths: batch)     // a fresh snapshot: an exclusion applies mid-run
             for path in batch {
                 let outcome = outcomes[path] ?? .failed("no outcome")
@@ -489,16 +526,18 @@ public final class Engine {
                     let message = "frame cutting failed repeatedly: \(String(reason.prefix(80)))"
                     try recordFailure(path, message: message)
                     try queue.fail(path: path, error: message)
+                    landed(path)
                     summary.failed += 1
                     continue
                 }
                 if case .deferred = outcome {} else { frameDeferrals.clear(path) }
                 switch outcome {
-                case .failed(let message): try queue.fail(path: path, error: message); summary.failed += 1; continue
+                case .failed(let message): try queue.fail(path: path, error: message); landed(path); summary.failed += 1; continue
                 case .deferred(let reason):
                     // Only this file's kind waits (no speech model, no frame cutting): images and PDFs go on.
                     let kindOnly = reason.hasPrefix("transcription unavailable") || reason.hasPrefix(Indexer.frameCuttingUnavailable)
                     try queue.requeue(path: path, delaySeconds: kindOnly ? Engine.deferDelaySeconds * 10 : Engine.deferDelaySeconds)
+                    landed(path)
                     summary.deferred += 1
                     if summary.pausedReason == nil, !kindOnly, reason != "paused" { summary.pausedReason = reason }   // "paused": the loop sees shouldContinue
                     continue
@@ -509,6 +548,7 @@ public final class Engine {
                 case .skipped: summary.skipped += 1
                 }
                 try queue.complete(path: path)
+                landed(path)
             }
             try drainForgets()                                // anything removed during this batch is dropped again
             done += batch.count
@@ -527,6 +567,21 @@ public final class Engine {
         kindsBox.unavailable.reduce(into: Set<String>()) { $0.formUnion(Kinds.extensions(of: $1)) }
     }
 
+    /// A claimed job that completed, failed or was put back normally: no longer in flight.
+    private func landed(_ path: String) {
+        claimLock.lock(); inFlight.removeAll { $0 == path }; claimLock.unlock()
+    }
+
+    /// For a normal quit: puts the batch being indexed back in the queue without counting an attempt, so the next launch
+    /// does not take it for a crash. One short write; idempotent; safe from any thread (the main thread at quit). It
+    /// does not wait for the indexing thread, which may still finish some of those files before the process ends.
+    public func releaseClaimed() throws {
+        claimLock.lock(); defer { claimLock.unlock() }
+        guard !inFlight.isEmpty else { return }
+        try queue.release(paths: inFlight)
+        inFlight = []
+    }
+
     /// Queues the files that failed three times again, with a clean slate: the frame cutter forgets which files
     /// stalled and the frame-cutting deferral counts start over.
     public func retryFailed() throws {
@@ -536,10 +591,23 @@ public final class Engine {
     }
 
     /// Shows a file the engine gave up on as failed (the indexer records its own failures; this is for the engine's).
+    /// A file already indexed keeps its content, so it stays searchable: its row stays `indexed` with the current size
+    /// and mtime (the scan leaves it alone until it changes) and a note starting `Store.keptAfterFailure`, which lists it
+    /// among the failed files and makes the next read (the user's retry) read it again.
     private func recordFailure(_ path: String, message: String) throws {
-        let attributes = try? FileManager.default.attributesOfItem(atPath: path)
-        let size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
-        let mtime = Int64((attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
+        var size: Int64 = 0, mtime: Int64 = 0
+        if let id = PhotosPath.parse(path)?.id {           // a Photos asset's change signature, so its scan leaves it too
+            if let info = assets?.info(id: id) { size = info.pixels; mtime = info.mtime }
+        } else {
+            let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+            size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
+            mtime = Int64((attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
+        }
+        if let record = try store.fileRecord(path: path), record.status == "indexed", let contentId = record.contentId {
+            try store.upsertFile(path: path, contentId: contentId, kind: record.kind, size: size, mtime: mtime,
+                                 status: "indexed", note: Store.keptAfterFailure + message)
+            return
+        }
         try store.upsertFile(path: path, contentId: nil, kind: Kinds.detect(path) ?? "video", size: size, mtime: mtime,
                              status: "failed", note: message)
     }

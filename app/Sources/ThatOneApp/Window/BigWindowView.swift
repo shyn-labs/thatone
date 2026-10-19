@@ -26,9 +26,9 @@ struct BigWindowView: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 12)], spacing: 12) {
                     ForEach(model.visibleRows) { row in
                         GridCell(row: row, thumbnails: thumbnails)
-                            .onTapGesture(count: 2) { actions.open(row.path) }
+                            .onTapGesture(count: 2) { model.search.open(row) }
                             .contextMenu {
-                                Button("Open") { actions.open(row.path) }
+                                Button("Open") { model.search.open(row) }
                                 Button("Reveal in Finder") { actions.reveal(row.path) }
                                 Button("Copy path") { actions.copyPath(row.path) }
                             }

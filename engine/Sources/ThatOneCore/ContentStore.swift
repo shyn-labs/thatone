@@ -146,7 +146,17 @@ extension Store {
                            contents: Int(try int("select count(*) from contents") ?? 0), filesByKind: kinds)
     }
 
+    /// Starts the note of an indexed file the engine gave up on: its last indexed content stays searchable.
+    public static let keptAfterFailure = "failed (showing the last indexed version): "
+
+    /// Whether `record` is an indexed file kept after a failure (read again on its next claim, never "unchanged").
+    static func isKeptAfterFailure(_ record: FileRecord) -> Bool {
+        record.status == "indexed" && record.note.hasPrefix(keptAfterFailure)
+    }
+
+    /// Failed files, and indexed files kept after a failure.
     public func failedFiles() throws -> [(path: String, note: String)] {
-        try query("select path, note from files where status = 'failed' order by path") { (path: $0.text(0), note: $0.text(1)) }
+        try query("select path, note from files where status = 'failed' or (status = 'indexed' and substr(note, 1, ?) = ?) order by path",
+                  [.int(Int64(Self.keptAfterFailure.unicodeScalars.count)), .text(Self.keptAfterFailure)]) { (path: $0.text(0), note: $0.text(1)) }
     }
 }

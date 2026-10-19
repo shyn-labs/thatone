@@ -108,6 +108,9 @@ public final class EngineHost: EngineService {
         let w = watcher
         watcher = nil
         lock.unlock()
+        // A normal quit: the batch being read goes back to the queue as it was, so the next launch does not take it for a
+        // crash. Quick, and does not wait for the indexing thread (the flag above stops it claiming another batch).
+        try? engine.releaseClaimed()
         w?.stop()
         stopPhotosWatcher()
     }

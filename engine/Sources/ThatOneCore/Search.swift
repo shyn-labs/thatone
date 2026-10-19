@@ -62,6 +62,13 @@ public struct Searcher {
     /// a few long videos (hundreds of distinct frames each) cannot fill the pool and push every other file out.
     public static let vectorOversample = 4
     public static let maxPerContent = 5
+    /// While hidden kinds are in the index, a search that names no kind fetches this many times more vectors, so a large
+    /// code index cannot push everything else out of it. A search that names kinds fetches `maxVectorK` and keeps only
+    /// those kinds. The keyword search needs no widening: it filters by kind inside its own SQL.
+    public static let hiddenOversample = 4
+    /// sqlite-vec refuses a larger k. A KNN query cannot filter by kind, so past this cap enough nearer hidden-kind
+    /// segments can still crowd the vector list; the keyword list has no such ceiling.
+    static let maxVectorK = 4096
 
     /// A caller-supplied limit is never trusted: negative or absurd values would trap or overflow below.
     static func clamp(_ limit: Int) -> Int { max(0, min(limit, maxLimit)) }
@@ -75,22 +82,46 @@ public struct Searcher {
                        limit rawLimit: Int = 10) throws -> [SearchHit] {
         let limit = Searcher.clamp(rawLimit)
         let k = filters.isEmpty ? Searcher.pool : Searcher.widePool   // filters run after retrieval
+        let hidden = Kinds.hiddenByDefault.subtracting(filters.kinds)   // hidden kinds this search does not name
+        let crowded = try filters.kinds.isEmpty && holdsContent(ofKinds: hidden)   // named kinds are filtered on both sides
+        let widen = crowded ? Searcher.hiddenOversample : 1
         var lists: [[Int64]] = []
         var viaVector = Set<Int64>()
         var viaKeyword = Set<Int64>()
         if let v = queryVector {
             guard v.count == store.dim else { throw StoreError.badVector(expected: store.dim, got: v.count) }
+            // vec0's KNN cannot join to the content's kind, so kinds are dropped after the fetch, capped at maxVectorK: hidden
+            // kinds not named, or, when kinds are named, every kind that is not. A named-kind search fetches the most it can.
+            let fetch = filters.kinds.isEmpty ? min(k * Searcher.vectorOversample * widen, Searcher.maxVectorK) : Searcher.maxVectorK
             let nearest = try store.query(
-                "select rowid from segment_vectors where embedding match ? and k = \(k * Searcher.vectorOversample) order by distance",
+                "select rowid from segment_vectors where embedding match ? and k = \(fetch) order by distance",
                 [.blob(Store.vectorBlob(v))]) { $0.int(0) }
-            let ids = try capPerContent(nearest, limit: k)
+            let named = filters.kinds
+            let ids = try capPerContent(nearest, limit: k, keeping: { named.isEmpty ? !(crowded && hidden.contains($0)) : named.contains($0) })
             viaVector = Set(ids)
             lists.append(ids)
         }
         if let expression = Tokens.ftsExpression(query) {
-            let ids = try store.query(
-                "select rowid from segments_fts where segments_fts match ? order by rank limit \(k)",
-                [.text(expression)]) { $0.int(0) }
+            let ids: [Int64]
+            if !filters.kinds.isEmpty {   // only the named kinds, inside the query, so no number of other matches fills the pool
+                let marks = Array(repeating: "?", count: filters.kinds.count).joined(separator: ",")
+                ids = try store.query(
+                    "select segments_fts.rowid from segments_fts join segments s on s.id = segments_fts.rowid"
+                        + " join contents c on c.id = s.content_id"
+                        + " where segments_fts match ? and c.kind in (\(marks)) order by segments_fts.rank limit \(k)",
+                    [.text(expression)] + filters.kinds.sorted().map { .text($0) }) { $0.int(0) }
+            } else if crowded {   // leave the hidden kinds out inside the query, so no number of their matches fills the pool
+                let marks = Array(repeating: "?", count: hidden.count).joined(separator: ",")
+                ids = try store.query(
+                    "select segments_fts.rowid from segments_fts join segments s on s.id = segments_fts.rowid"
+                        + " join contents c on c.id = s.content_id"
+                        + " where segments_fts match ? and c.kind not in (\(marks)) order by segments_fts.rank limit \(k)",
+                    [.text(expression)] + hidden.sorted().map { .text($0) }) { $0.int(0) }
+            } else {
+                ids = try store.query(
+                    "select rowid from segments_fts where segments_fts match ? order by rank limit \(k)",
+                    [.text(expression)]) { $0.int(0) }
+            }
             viaKeyword = Set(ids)
             lists.append(ids)
         }
@@ -132,27 +163,41 @@ public struct Searcher {
         return Array(hits.prefix(limit))
     }
 
-    /// `ids` (nearest first) with at most `maxPerContent` segments of any one content, cut to `limit`.
-    private func capPerContent(_ ids: [Int64], limit: Int) throws -> [Int64] {
-        var contentOf: [Int64: Int64] = [:]
+    /// The content and kind owning each segment id.
+    private func owners(of ids: [Int64]) throws -> [Int64: (content: Int64, kind: String)] {
+        var out: [Int64: (content: Int64, kind: String)] = [:]
         for start in stride(from: 0, to: ids.count, by: 400) {
             let chunk = Array(ids[start..<min(start + 400, ids.count)])
             let marks = Array(repeating: "?", count: chunk.count).joined(separator: ",")
-            for (id, content) in try store.query("select id, content_id from segments where id in (\(marks))",
-                                                 chunk.map { .int($0) }, { ($0.int(0), $0.int(1)) }) {
-                contentOf[id] = content
+            for (id, content, kind) in try store.query(
+                "select s.id, s.content_id, c.kind from segments s join contents c on c.id = s.content_id where s.id in (\(marks))",
+                chunk.map { .int($0) }, { ($0.int(0), $0.int(1), $0.text(2)) }) {
+                out[id] = (content, kind)
             }
         }
+        return out
+    }
+
+    /// `ids` (nearest first) of the kinds `keeping` accepts, with at most `maxPerContent` segments of any one content, cut to `limit`.
+    private func capPerContent(_ ids: [Int64], limit: Int, keeping: (String) -> Bool) throws -> [Int64] {
+        let owner = try owners(of: ids)
         var taken: [Int64: Int] = [:]
         var kept: [Int64] = []
         for id in ids {
             guard kept.count < limit else { break }
-            guard let content = contentOf[id] else { continue }
-            if taken[content, default: 0] >= Searcher.maxPerContent { continue }
-            taken[content, default: 0] += 1
+            guard let o = owner[id], keeping(o.kind) else { continue }
+            if taken[o.content, default: 0] >= Searcher.maxPerContent { continue }
+            taken[o.content, default: 0] += 1
             kept.append(id)
         }
         return kept
+    }
+
+    private func holdsContent(ofKinds kinds: Set<String>) throws -> Bool {
+        guard !kinds.isEmpty else { return false }
+        let marks = Array(repeating: "?", count: kinds.count).joined(separator: ",")
+        return try store.int("select exists(select 1 from contents where status = 'indexed' and kind in (\(marks)))",
+                             kinds.sorted().map { .text($0) }) == 1
     }
 
     /// The newest indexed files first, one hit per content (browsing without a query).
@@ -178,11 +223,18 @@ public struct Searcher {
         }
     }
 
-    /// Images that look like this one: nearest neighbours of its image vector, never the content itself.
+    /// Files that look like this one: nearest neighbours of its (image first) vector, never the content itself. With no kinds
+    /// named, a hidden-kind source (code) searches its own kind.
     public func similar(toContentId contentId: Int64, filters: SearchFilters = SearchFilters(),
                         limit rawLimit: Int = 30) throws -> [SearchHit] {
         let limit = Searcher.clamp(rawLimit)
         guard let vector = try vector(ofContent: contentId) else { return [] }
+        var filters = filters
+        if filters.kinds.isEmpty,   // more like a code file means more code: name the source's hidden kind
+           let kind = try store.query("select kind from contents where id = ?", [.int(contentId)], { $0.text(0) }).first,
+           Kinds.hiddenByDefault.contains(kind) {
+            filters.kinds = [kind]
+        }
         let hits = try search(query: "", queryVector: vector, filters: filters, limit: limit + 1)
         return Array(hits.filter { $0.contentId != contentId }.prefix(limit))
     }
@@ -206,6 +258,9 @@ public struct Searcher {
         if !f.kinds.isEmpty {
             sql += " and kind in (" + Array(repeating: "?", count: f.kinds.count).joined(separator: ",") + ")"
             binds += f.kinds.sorted().map { .text($0) }
+        } else if !Kinds.hiddenByDefault.isEmpty {     // a search that names no kind leaves code out
+            sql += " and kind not in (" + Array(repeating: "?", count: Kinds.hiddenByDefault.count).joined(separator: ",") + ")"
+            binds += Kinds.hiddenByDefault.sorted().map { .text($0) }
         }
         if let folder = f.folder {
             let prefix = folder.hasSuffix("/") ? folder : folder + "/"

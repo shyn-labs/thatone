@@ -368,6 +368,25 @@ final class EngineHostTests: XCTestCase {
         XCTAssertEqual(host.snapshot.enabledKinds, ["image", "text", "pdf"])
     }
 
+    // MARK: quitting
+
+    func testStopPutsTheClaimedBatchBackWithoutWaitingForIt() async throws {
+        let s = try setup(images: 3)
+        s.embedder.delay = 2                                                              // a long read is in progress at quit
+        s.host.start()
+        let claimed = await eventually { (try? s.engine.queue.counts().running) == 3 && s.embedder.calls > 0 }
+        XCTAssertTrue(claimed)
+        let started = Date()
+        s.host.stop()                                                                     // what applicationWillTerminate runs
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1)                           // does not wait for the read
+        let counts = try s.engine.queue.counts()
+        XCTAssertEqual([counts.queued, counts.running, counts.failed], [3, 0, 0])
+        let history = try s.engine.store.query("select attempts, last_error from jobs") { "\($0.int(0))|\($0.text(1))" }
+        XCTAssertEqual(history, ["0|", "0|", "0|"])                                       // the next launch sees no crash
+        let settled = await eventually { (try? s.engine.queue.counts()).map { $0.queued + $0.running + $0.failed } == 0 }
+        XCTAssertTrue(settled)                                                            // the read in progress still lands
+    }
+
     // MARK: memory pressure
 
     func testLowMemoryStopsIndexingBetweenBatchesAndItResumesWhenMemoryFrees() async throws {

@@ -15,6 +15,7 @@ struct KindSwitch: Identifiable {
         KindSwitch(kind: "audio", title: "Audio (transcribed on this Mac)", note: "Needs the Whisper model; can take hours for a large library."),
         KindSwitch(kind: "video", title: "Video (frames and soundtrack)", note: "Needs the Whisper model; frames are sampled every few seconds and the sound is transcribed; can take hours for a large library."),
         KindSwitch(kind: "text", title: "Text-like files (txt, md, html)", note: "Can add tens of thousands of files, mostly data and notes inside projects."),
+        KindSwitch(kind: "code", title: "Code", note: "Respects .gitignore; hidden from normal searches unless you pick Code"),
     ]
 
     /// `kinds` with `kind` switched on or off; unknown names never get in.

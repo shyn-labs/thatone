@@ -17,7 +17,7 @@ public final class AppModel {
     private let home: String
     private let registersHotKey: Bool
     private let thumbnails: ThumbnailCache
-    private let actions = FileActions()
+    private let actions: FileActions
     private var panel: PanelController?
     private var bigWindowController: BigWindowController?
     private var menu: MenuBarController?
@@ -33,6 +33,7 @@ public final class AppModel {
                 memory: MemoryPressureSource = SystemMemoryPressure(), speech: SpeechSession? = nil) {
         let relay = Relay()
         self.engine = engine
+        self.actions = FileActions(editor: { [engine] in engine.config.editor })
         self.home = home
         self.registersHotKey = registersHotKey
         self.preset = HotKeyPreset.preset(id: engine.config.hotKey)
@@ -47,6 +48,13 @@ public final class AppModel {
         relay.target = { [weak self] snapshot in MainActor.assumeIsolated { self?.menu?.update(snapshot) } }
         host.uiHandler = { [weak self] action in try self?.handleUI(action) }
     }
+
+    /// The editor code results open in, as Settings shows it.
+    public var editorChoice: String {
+        Editor.resolve(engine.config.editor, isInstalled: { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) != nil })
+    }
+
+    public func setEditor(_ id: String?) { try? engine.setEditor(id) }
 
     public var needsWelcome: Bool { engine.config.folders.isEmpty }
     public var currentPreset: HotKeyPreset { preset }

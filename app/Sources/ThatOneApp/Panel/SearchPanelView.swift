@@ -153,6 +153,8 @@ struct PreviewView: View {
                 AudioPreviewView(row: row)
             } else if row.kind == "video" {
                 VideoPreviewView(row: row, thumbnail: image)
+            } else if row.kind == "code" {
+                CodePreviewView(row: row)
             } else if row.kind == "pdf" {
                 PDFPageView(path: row.path, page: row.page ?? 1)
                     .frame(maxWidth: .infinity, maxHeight: 300)

@@ -36,6 +36,9 @@ enum Schema {
                 """)
             try store.run("create index jobs_state on jobs(state, priority)")
         },
+        { store, _ in  // v3: every search asks whether hidden kinds (code) are indexed; answer from an index
+            try store.run("create index contents_kind on contents(kind, status)")
+        },
     ]
 }
 

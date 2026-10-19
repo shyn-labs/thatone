@@ -12,68 +12,82 @@ public final class Crawler {
     private let exclusions: Exclusions
     private let enabledKinds: () -> Set<String>
     private let unavailableKinds: () -> Set<String>
+    private let codeExclusions: CodeExclusions
+    /// Tests: told each folder a `.gitignore` change rescans.
+    var onRescan: ((String) -> Void)?
 
     public init(store: Store, queue: JobQueue, exclusions: Exclusions = Exclusions(),
                 enabledKinds: @escaping () -> Set<String> = { Kinds.defaultEnabled },
-                unavailableKinds: @escaping () -> Set<String> = { [] }) {
+                unavailableKinds: @escaping () -> Set<String> = { [] },
+                codeExclusions: CodeExclusions = CodeExclusions()) {
         self.store = store
         self.queue = queue
         self.exclusions = exclusions
         self.enabledKinds = enabledKinds
         self.unavailableKinds = unavailableKinds
+        self.codeExclusions = codeExclusions
     }
 
     /// A supported kind that is switched on.
     private func isIndexable(_ path: String) -> Bool { Kinds.detect(path).map { enabledKinds().contains($0) } ?? false }
 
-    /// Queues new or changed images under each root, and a purge job for every recorded path it no longer sees
+    /// Queues new or changed files under each root, and a purge job for every recorded path it no longer sees
     /// (deleted, moved away, or newly excluded). The indexer does the actual forgetting.
     public func scan(roots: [String]) throws -> ScanResult {
         var result = ScanResult()
         let unavailable = unavailableKinds()            // kinds this process cannot read (audio and video in the CLI): what it holds stays put
-        let keys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
         for rawRoot in roots {
             let root = RealPath.of(rawRoot)
-            // An unplugged drive or a folder we may not read looks exactly like an empty one. Leave its index alone.
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: root, isDirectory: &isDirectory), isDirectory.boolValue,
-                  FileManager.default.isReadableFile(atPath: root) else { continue }
-            var seen = Set<String>()
-            var unreadable: [String] = []
-            guard let enumerator = FileManager.default.enumerator(
-                at: URL(fileURLWithPath: root), includingPropertiesForKeys: keys, options: [.skipsPackageDescendants],
-                errorHandler: { url, _ in unreadable.append(url.path); return true })
-            else { continue }
-            for case let url as URL in enumerator {
-                guard let values = try? url.resourceValues(forKeys: Set(keys)) else { continue }
-                if values.isDirectory == true {
-                    if exclusions.isExcludedDirectory(named: url.lastPathComponent)
-                        || exclusions.isExcluded(path: url.path + "/x", root: root) {
-                        enumerator.skipDescendants()
-                    } else if !FileManager.default.isReadableFile(atPath: url.path)
-                                || !FileManager.default.isExecutableFile(atPath: url.path) {
-                        unreadable.append(url.path)    // listed but not enterable: what is inside is unknown, not gone
-                    }
-                    continue
-                }
-                guard values.isRegularFile == true, isIndexable(url.path),
-                      !exclusions.isExcluded(path: url.path, root: root) else { continue }
-                let path = url.path
-                seen.insert(path)
-                let size = Int64(values.fileSize ?? 0)
-                let mtime = Int64(values.contentModificationDate?.timeIntervalSince1970 ?? 0)
-                if let record = try store.fileRecord(path: path), record.size == size, record.mtime == mtime { continue }
-                try queue.enqueue(path: path, priority: mtime)
-                result.enqueued += 1
-            }
-            for known in try store.filePaths(under: root)
-                where !seen.contains(known) && !unreadable.contains(where: { known.hasPrefix($0 + "/") })
-                    && !(Kinds.detect(known).map { unavailable.contains($0) } ?? false) {
-                try queue.enqueue(path: known, priority: Int64.min)
-                result.purgeQueued += 1
-            }
+            try scanTree(root, root: root, unavailable: unavailable, into: &result)
         }
         return result
+    }
+
+    /// Scans `start` (a root, or a folder under it after its `.gitignore` changed). Rules that depend on the root
+    /// (excluded folder names, build folders, `.gitignore`) are judged from `root`.
+    private func scanTree(_ start: String, root: String, unavailable: Set<String>, into result: inout ScanResult) throws {
+        let keys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
+        // An unplugged drive or a folder we may not read looks exactly like an empty one. Leave its index alone.
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: start, isDirectory: &isDirectory), isDirectory.boolValue,
+              FileManager.default.isReadableFile(atPath: start) else { return }
+        var seen = Set<String>()
+        var unreadable: [String] = []
+        let ignore = codeExclusions.stack(forRoot: root)
+        guard let enumerator = FileManager.default.enumerator(
+            at: URL(fileURLWithPath: start), includingPropertiesForKeys: keys, options: [.skipsPackageDescendants],
+            errorHandler: { url, _ in unreadable.append(url.path); return true })
+        else { return }
+        for case let url as URL in enumerator {
+            guard let values = try? url.resourceValues(forKeys: Set(keys)) else { continue }
+            if values.isDirectory == true {
+                if exclusions.isExcludedDirectory(named: url.lastPathComponent)
+                    || exclusions.isExcluded(path: url.path + "/x", root: root) {
+                    enumerator.skipDescendants()
+                } else if !FileManager.default.isReadableFile(atPath: url.path)
+                            || !FileManager.default.isExecutableFile(atPath: url.path) {
+                    unreadable.append(url.path)    // listed but not enterable: what is inside is unknown, not gone
+                }
+                continue
+            }
+            guard values.isRegularFile == true, isIndexable(url.path),
+                  !exclusions.isExcluded(path: url.path, root: root) else { continue }
+            let path = url.path
+            // Ignored code is not "seen": a copy indexed before the rule existed gets a purge job below.
+            if Kinds.detect(path) == "code", codeExclusions.reason(path: path, root: root, stack: ignore) != nil { continue }
+            seen.insert(path)
+            let size = Int64(values.fileSize ?? 0)
+            let mtime = Int64(values.contentModificationDate?.timeIntervalSince1970 ?? 0)
+            if let record = try store.fileRecord(path: path), record.size == size, record.mtime == mtime { continue }
+            try queue.enqueue(path: path, priority: mtime)
+            result.enqueued += 1
+        }
+        for known in try store.filePaths(under: start)
+            where !seen.contains(known) && !unreadable.contains(where: { known.hasPrefix($0 + "/") })
+                && !(Kinds.detect(known).map { unavailable.contains($0) } ?? false) {
+            try queue.enqueue(path: known, priority: JobQueue.purgePriority)
+            result.purgeQueued += 1
+        }
     }
 
     /// Queues new or changed Apple Photos assets and a purge job for every recorded `photos:` path that is no longer
@@ -100,24 +114,52 @@ public final class Crawler {
             result.enqueued += 1
         }
         for known in try store.filePaths(withPrefix: PhotosPath.scheme) where !seen.contains(known) {
-            try queue.enqueue(path: known, priority: Int64.min)
+            try queue.enqueue(path: known, priority: JobQueue.purgePriority)
             result.purgeQueued += 1
         }
         return result
     }
 
     /// Applies FSEvents changes: queues files that appeared or changed, and a purge job for paths that went away.
+    /// A `.gitignore` that changed (or appeared, or went) rescans its folder, so code it now ignores is purged and code
+    /// it no longer ignores is queued.
     public func handle(_ changes: [FileWatcher.Change], roots: [String]) throws {
         let realRoots = roots.map(RealPath.of)
+        var rescans: [(folder: String, root: String)] = []
         for change in changes {
             guard let root = realRoots.first(where: { change.path.hasPrefix($0.hasSuffix("/") ? $0 : $0 + "/") }) else { continue }
+            if (change.path as NSString).lastPathComponent == ".gitignore" {
+                guard enabledKinds().contains("code"), !exclusions.isExcluded(path: change.path, root: root) else { continue }
+                rescans.append(((change.path as NSString).deletingLastPathComponent, root))
+                continue
+            }
             if FileManager.default.fileExists(atPath: change.path) {
                 guard isIndexable(change.path), !exclusions.isExcluded(path: change.path, root: root) else { continue }
+                if Kinds.detect(change.path) == "code", codeExclusions.reason(path: change.path, root: root) != nil { continue }
                 let modified = (try? FileManager.default.attributesOfItem(atPath: change.path)[.modificationDate]) as? Date
                 try queue.enqueue(path: change.path, priority: Int64(modified?.timeIntervalSince1970 ?? 0))
             } else {
-                try queue.enqueue(path: change.path, priority: Int64.min)
+                try queue.enqueue(path: change.path, priority: JobQueue.purgePriority)
             }
+        }
+        // Each folder once, and none inside another folder this batch rescans: that rescan already covers it.
+        let folders = Set(rescans.map(\.folder))
+        var done = Set<String>()
+        for (folder, root) in rescans where done.insert(folder).inserted && !Self.hasAncestor(folder, in: folders) {
+            var ignored = ScanResult()
+            onRescan?(folder)
+            try scanTree(folder, root: root, unavailable: unavailableKinds(), into: &ignored)
+        }
+    }
+
+    /// Whether a proper ancestor folder of `folder` is in `folders`.
+    static func hasAncestor(_ folder: String, in folders: Set<String>) -> Bool {
+        var current = folder
+        while true {
+            let parent = (current as NSString).deletingLastPathComponent
+            if parent == current || parent.isEmpty { return false }
+            if folders.contains(parent) { return true }
+            current = parent
         }
     }
 }

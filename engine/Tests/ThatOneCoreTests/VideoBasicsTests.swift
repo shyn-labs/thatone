@@ -11,7 +11,7 @@ final class VideoBasicsTests: XCTestCase {
 
     func testDefaultsExcludeVideoAndOrder() {
         XCTAssertFalse(Kinds.defaultEnabled.contains("video"))
-        XCTAssertEqual(Kinds.all, ["image", "pdf", "document", "text", "audio", "video"])
+        XCTAssertEqual(Kinds.all, ["image", "pdf", "document", "text", "audio", "video", "code"])
     }
 
     func testLimits() {

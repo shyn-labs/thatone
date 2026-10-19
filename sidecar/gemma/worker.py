@@ -7,7 +7,20 @@ import mlx.core as mx
 import numpy as np
 from PIL import Image, ImageOps
 
+from batching import MAX_TEXTS, TOKEN_BUDGET, plan_batches
 from thatone_protocol import ProtocolError, serve
+
+# MLX keeps freed GPU buffers in a cache for reuse and never hands them back on its own, so a
+# worker that once ran a big batch stays big. The limit caps what that cache may hold while a
+# request runs (buffers past it are freed instead of cached); release_cache() empties it after
+# every request so an idle worker returns to roughly the model's own size.
+CACHE_LIMIT_BYTES = 1 << 30
+
+
+def release_cache() -> None:
+    clear = getattr(mx, "clear_cache", None) or mx.metal.clear_cache
+    clear()
+
 
 MODEL_ID = os.environ.get("THATONE_GEMMA_MODEL", "mlx-community/embeddinggemma-2-8bit")
 QUERY_PREFIX = "task: search result | query: "
@@ -31,6 +44,9 @@ def load_audio(path: str) -> np.ndarray:
 class GemmaBackend:
     def __init__(self):
         from mlx_vlm import load
+        set_limit = getattr(mx, "set_cache_limit", None) or getattr(mx.metal, "set_cache_limit", None)
+        if set_limit:
+            set_limit(CACHE_LIMIT_BYTES)
         self.model, self.processor = load(MODEL_ID)
         self.tokenizer = getattr(self.processor, "tokenizer", self.processor)
         self.audio_kw = None  # discovered on first audio call: "audio" or "audios"
@@ -46,11 +62,28 @@ class GemmaBackend:
         return np.array(emb)
 
     def embed(self, modality, role, inputs):
-        if modality == "text":
-            prefix = QUERY_PREFIX if role == "query" else DOC_PREFIX
-            enc = self.tokenizer([prefix + t for t in inputs], padding=True, truncation=True,
+        try:
+            return self._embed(modality, role, inputs)
+        finally:
+            release_cache()
+
+    def _embed_text(self, role, inputs) -> np.ndarray:
+        prefix = QUERY_PREFIX if role == "query" else DOC_PREFIX
+        texts = [prefix + t for t in inputs]
+        # Padding a batch to its longest text makes one long chunk cost every row that length, so
+        # group by length and cap padded tokens per forward pass (see batching.py).
+        ids = self.tokenizer(texts, truncation=True, max_length=MAX_TEXT_TOKENS)["input_ids"]
+        out = np.zeros((len(texts), 768), dtype=np.float32)
+        for group in plan_batches([len(x) for x in ids], TOKEN_BUDGET, MAX_TEXTS):
+            enc = self.tokenizer([texts[i] for i in group], padding=True, truncation=True,
                                  max_length=MAX_TEXT_TOKENS, return_tensors="np")
-            return self._run(dict(enc))
+            out[group] = self._run(dict(enc))
+            release_cache()
+        return out
+
+    def _embed(self, modality, role, inputs):
+        if modality == "text":
+            return self._embed_text(role, inputs)
         if modality == "image":
             try:
                 # Phone photos store rotation in EXIF; apply it so portraits aren't embedded sideways.

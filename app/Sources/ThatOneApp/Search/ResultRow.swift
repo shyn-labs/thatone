@@ -20,6 +20,8 @@ public struct ResultRow: Identifiable, Equatable {
     public let modified: Date?
     public let page: Int?          // the first page a match is on (PDFs): where the preview opens
     public let startTime: Double?  // where the first match starts (audio): where the player begins
+    public let line: Int?          // the first line of the best code match: where the editor opens
+    public let lineEnd: Int?       // its last line: where the preview stops
     public let excerpt: String     // the matched text of the best anchor, for documents' preview
 
     public init(hit: ServiceHit, home: String = NSHomeDirectory()) {
@@ -36,6 +38,9 @@ public struct ResultRow: Identifiable, Equatable {
         chips = hit.anchors.compactMap { AnchorChip.text(from: $0.anchor) }.filter { seen.insert($0).inserted }
         page = hit.anchors.compactMap { AnchorChip.page(from: $0.anchor) }.first
         startTime = hit.anchors.compactMap { AnchorChip.startTime(from: $0.anchor) }.first
+        let range = hit.anchors.compactMap { AnchorChip.lineRange(from: $0.anchor) }.first
+        line = range?.first
+        lineEnd = range?.last
         excerpt = hit.anchors.first(where: { !$0.text.isEmpty })?.text ?? ""
         if let match = hit.anchors.first(where: { $0.viaKeyword && !$0.text.isEmpty }) { why = .snippet(match.text) }
         else if hit.anchors.contains(where: { $0.viaVector }) { why = .visual }
@@ -57,6 +62,13 @@ public enum AnchorChip {
         guard let data = json.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return (object["t0"] as? NSNumber)?.doubleValue
+    }
+
+    public static func lineRange(from json: String) -> (first: Int, last: Int)? {
+        guard let data = json.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let first = (object["line0"] as? NSNumber)?.intValue, let last = (object["line1"] as? NSNumber)?.intValue else { return nil }
+        return (first, last)
     }
 
     public static func text(from json: String) -> String? {

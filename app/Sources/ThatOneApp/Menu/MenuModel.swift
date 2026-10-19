@@ -32,6 +32,10 @@ public enum MenuModel {
         if videos > 0 {
             extras.append(MenuItemSpec(id: "videos", title: "\(videos) \(videos == 1 ? "video" : "videos")", enabled: false))
         }
+        let code = s.kinds["code", default: 0]
+        if code > 0 {
+            extras.append(MenuItemSpec(id: "code", title: "\(code) code \(code == 1 ? "file" : "files")", enabled: false))
+        }
         if pdfs + documents > 0 {
             extras.append(MenuItemSpec(id: "kinds", title: "\(pdfs) \(pdfs == 1 ? "PDF" : "PDFs"), \(documents) \(documents == 1 ? "document" : "documents")", enabled: false))
         }

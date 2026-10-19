@@ -28,6 +28,7 @@ public final class Indexer {
     private let embedder: Embedder
     private let workDir: URL
     private let exclusions: Exclusions
+    private let codeExclusions: CodeExclusions
     private let roots: () -> [String]
     private let ocr: (CGImage) throws -> String
     private let assets: AssetProvider?
@@ -41,6 +42,7 @@ public final class Indexer {
     let runDirectory: URL
 
     public init(store: Store, embedder: Embedder, workDir: URL, exclusions: Exclusions = Exclusions(),
+                codeExclusions: CodeExclusions = CodeExclusions(),
                 roots: @escaping () -> [String] = { [] },
                 ocr: @escaping (CGImage) throws -> String = { try OCR.text(in: $0) },
                 assets: AssetProvider? = nil,
@@ -55,11 +57,12 @@ public final class Indexer {
         self.enabledKinds = enabledKinds
         self.unavailableKinds = unavailableKinds
         self.frameCutter = frameCutter
-        self.readers = readers ?? Self.makeReaders(ocr: ocr, transcriber: transcriber, shouldContinue: shouldContinue)
+        self.readers = readers ?? Self.makeReaders(ocr: ocr, transcriber: transcriber, shouldContinue: shouldContinue, roots: roots)
         self.store = store
         self.embedder = embedder
         self.workDir = workDir
         self.exclusions = exclusions
+        self.codeExclusions = codeExclusions
         self.roots = roots
         self.ocr = ocr
         self.runDirectory = workDir.appendingPathComponent("run-\(getpid())-\(UUID().uuidString)")
@@ -67,9 +70,10 @@ public final class Indexer {
 
     /// The readers for files that are read whole. Audio and video need the speech model, so they exist only with a transcriber.
     static func makeReaders(ocr: @escaping (CGImage) throws -> String, transcriber: Transcriber?,
-                            shouldContinue: @escaping () -> Bool,
+                            shouldContinue: @escaping () -> Bool, roots: @escaping () -> [String] = { [] },
                             audioProbe: AudioProbe = .system, videoProbe: VideoProbe = .system) -> [String: FileReader] {
-        var made: [String: FileReader] = ["pdf": PDFReader(ocr: ocr), "document": DocumentReader(), "text": DocumentReader()]
+        var made: [String: FileReader] = ["pdf": PDFReader(ocr: ocr), "document": DocumentReader(), "text": DocumentReader(),
+                                          "code": CodeReader(roots: roots)]
         if let transcriber {
             made["audio"] = AudioReader(transcriber: transcriber, probe: audioProbe, shouldContinue: shouldContinue)
             // A soundtrack is as big as its video: the audio part takes the video size cap, not the audio one.
@@ -161,10 +165,14 @@ public final class Indexer {
             try store.removeFile(path: path)    // newly excluded, switched off or unsupported: forget anything indexed earlier
             return .done(.skipped(detected == nil ? "unsupported file type" : (enabledKinds().contains(detected!) ? "excluded" : "\(detected!) files are switched off")))
         }
+        if kind == "code", let reason = codeExclusions.reason(path: path, root: root) {
+            try store.removeFile(path: path)    // newly ignored or in a build folder: forget anything indexed earlier
+            return .done(.skipped(reason))
+        }
         let attributes = try fm.attributesOfItem(atPath: path)
         let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
         let mtime = Int64((attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
-        if let record = try store.fileRecord(path: path), record.size == size, record.mtime == mtime,
+        if let record = try store.fileRecord(path: path), record.size == size, record.mtime == mtime, !Store.isKeptAfterFailure(record),
            record.status == "indexed" || record.status == "skipped" {
             return .done(.unchanged)
         }
@@ -196,7 +204,7 @@ public final class Indexer {
                                  status: "skipped", note: AssetNotes.video)
             return .done(.skipped(AssetNotes.video))
         }
-        if let record = try store.fileRecord(path: path), record.size == info.pixels, record.mtime == info.mtime,
+        if let record = try store.fileRecord(path: path), record.size == info.pixels, record.mtime == info.mtime, !Store.isKeptAfterFailure(record),
            record.status == "indexed" || (record.status == "skipped" && record.note != AssetNotes.inCloud) {
             return .done(.unchanged)
         }
